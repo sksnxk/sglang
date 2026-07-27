@@ -15,7 +15,7 @@ from sglang.kernels.ops.attention.fla.kda import (
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils.common import get_device, is_npu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -24,8 +24,8 @@ register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
 @unittest.skipIf(
-    not (torch.cuda.is_available() or torch.xpu.is_available()),
-    "Test requires CUDA or XPU",
+    not (torch.cuda.is_available() or torch.xpu.is_available() or is_npu()),
+    "Test requires CUDA, XPU, or NPU",
 )
 class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
     def setUp(self):
@@ -151,7 +151,10 @@ class TestKDAFusedSigmoidGatingRecurrent(unittest.TestCase):
         self.assertTrue(torch.allclose(last_state, last_state_ref))
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+@unittest.skipIf(
+    not (torch.cuda.is_available() or is_npu()),
+    "Test requires CUDA or NPU",
+)
 class TestKDAGateChunkCumsum(unittest.TestCase):
     """Test kda_gate_chunk_cumsum against torch reference (gate activation + cumsum)."""
 
@@ -175,17 +178,18 @@ class TestKDAGateChunkCumsum(unittest.TestCase):
 
     def _run_case(self, B, T_per_seq, H, K, use_bias, use_varlen):
         T = B * T_per_seq
+        device = get_device()
         torch.manual_seed(42)
-        raw_g = torch.randn(1, T, H, K, dtype=torch.bfloat16, device="cuda")
-        A_log = torch.randn(H, dtype=torch.float32, device="cuda") * 0.5
+        raw_g = torch.randn(1, T, H, K, dtype=torch.bfloat16, device=device)
+        A_log = torch.randn(H, dtype=torch.float32, device=device) * 0.5
         dt_bias = (
-            torch.randn(H * K, dtype=torch.float32, device="cuda") * 0.1
+            torch.randn(H * K, dtype=torch.float32, device=device) * 0.1
             if use_bias
             else None
         )
         cu_seqlens = (
             torch.arange(
-                0, (B + 1) * T_per_seq, T_per_seq, dtype=torch.long, device="cuda"
+                0, (B + 1) * T_per_seq, T_per_seq, dtype=torch.long, device=device
             )
             if use_varlen
             else None
@@ -247,7 +251,10 @@ class TestKDAGateChunkCumsum(unittest.TestCase):
         )
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+@unittest.skipIf(
+    not (torch.cuda.is_available() or is_npu()),
+    "Test requires CUDA or NPU",
+)
 class TestKDAChunkExponentDomain(CustomTestCase):
     """Guard KDA prefill against mixing natural-log gates with exp2 kernels."""
 
@@ -383,7 +390,10 @@ class TestKDAChunkExponentDomain(CustomTestCase):
                 self.assertLess(state_error, 1e-2, f"state error={state_error:.3%}")
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+@unittest.skipIf(
+    not (torch.cuda.is_available() or is_npu()),
+    "Test requires CUDA or NPU",
+)
 class TestKDAPackedDecode(unittest.TestCase):
     """Verify ``fused_recurrent_kda_packed_decode`` matches the existing decode
     path (split + unflatten + ``fused_sigmoid_gating_delta_rule_update``)."""
