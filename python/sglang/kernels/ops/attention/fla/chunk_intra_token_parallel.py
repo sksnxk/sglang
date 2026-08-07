@@ -18,8 +18,8 @@ from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 @triton.autotune(
     configs=[
         triton.Config({"BH": BH}, num_warps=num_warps)
-        for BH in [1, 2, 4, 8]
-        for num_warps in [1, 2, 4, 8]
+        for BH in [1]
+        for num_warps in [1]
     ],
     key=["K", "H"],
     **autotune_cache_kwargs,

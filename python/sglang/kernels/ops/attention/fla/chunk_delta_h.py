@@ -143,25 +143,28 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # main recurrence
     for i_t in range(NT):
-        p_h1 = tl.make_block_ptr(
-            h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
-        )
-        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
+        # Store h via flat 1D pointer (workaround for triton-ascend compiler bug
+        # where block_ptr store to (V, K) shape corrupts the source register).
+        # The copy (b_h1 + 0) forces the compiler to use a fresh register.
+        b_h1_store = b_h1 + tl.zeros([BV, 64], dtype=tl.float32)
+        b_h1_flat = tl.reshape(b_h1_store, (BV * 64,))
+        p_h1 = h + i_t * stride_h + i_v * BV * K + tl.arange(0, BV * 64)
+        tl.store(p_h1, b_h1_flat.to(h.dtype.element_ty))
         if K > 64:
-            p_h2 = tl.make_block_ptr(
-                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
-            )
-            tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+            b_h2_store = b_h2 + tl.zeros([BV, 64], dtype=tl.float32)
+            b_h2_flat = tl.reshape(b_h2_store, (BV * 64,))
+            p_h2 = h + i_t * stride_h + i_v * BV * K + 64 + tl.arange(0, BV * 64)
+            tl.store(p_h2, b_h2_flat.to(h.dtype.element_ty))
         if K > 128:
-            p_h3 = tl.make_block_ptr(
-                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
-            )
-            tl.store(p_h3, b_h3.to(p_h3.dtype.element_ty), boundary_check=(0, 1))
+            b_h3_store = b_h3 + tl.zeros([BV, 64], dtype=tl.float32)
+            b_h3_flat = tl.reshape(b_h3_store, (BV * 64,))
+            p_h3 = h + i_t * stride_h + i_v * BV * K + 128 + tl.arange(0, BV * 64)
+            tl.store(p_h3, b_h3_flat.to(h.dtype.element_ty))
         if K > 192:
-            p_h4 = tl.make_block_ptr(
-                h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
-            )
-            tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), boundary_check=(0, 1))
+            b_h4_store = b_h4 + tl.zeros([BV, 64], dtype=tl.float32)
+            b_h4_flat = tl.reshape(b_h4_store, (BV * 64,))
+            p_h4 = h + i_t * stride_h + i_v * BV * K + 192 + tl.arange(0, BV * 64)
+            tl.store(p_h4, b_h4_flat.to(h.dtype.element_ty))
 
         p_w = tl.make_block_ptr(
             w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
@@ -286,23 +289,22 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # epilogue
     if INPLACE_UPDATE:
-        p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-        tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+        # Use flat 1D store (same workaround as h store above)
+        b_h1_flat = tl.reshape(b_h1, (BV * 64,))
+        p_ht = ht + i_v * BV * K + tl.arange(0, BV * 64)
+        tl.store(p_ht, b_h1_flat.to(ht.dtype.element_ty))
         if K > 64:
-            p_ht = tl.make_block_ptr(
-                ht, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
-            )
-            tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            b_h2_flat = tl.reshape(b_h2, (BV * 64,))
+            p_ht = ht + i_v * BV * K + 64 + tl.arange(0, BV * 64)
+            tl.store(p_ht, b_h2_flat.to(ht.dtype.element_ty))
         if K > 128:
-            p_ht = tl.make_block_ptr(
-                ht, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0)
-            )
-            tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            b_h3_flat = tl.reshape(b_h3, (BV * 64,))
+            p_ht = ht + i_v * BV * K + 128 + tl.arange(0, BV * 64)
+            tl.store(p_ht, b_h3_flat.to(ht.dtype.element_ty))
         if K > 192:
-            p_ht = tl.make_block_ptr(
-                ht, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0)
-            )
-            tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            b_h4_flat = tl.reshape(b_h4, (BV * 64,))
+            p_ht = ht + i_v * BV * K + 192 + tl.arange(0, BV * 64)
+            tl.store(p_ht, b_h4_flat.to(ht.dtype.element_ty))
 
 
 def chunk_gated_delta_rule_fwd_h(

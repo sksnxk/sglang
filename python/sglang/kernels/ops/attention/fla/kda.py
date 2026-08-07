@@ -35,7 +35,7 @@ if is_intel:
     )
 
 
-BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+BS_LIST = [32]
 
 # Convert natural-log gates to log2 space before the exp2-based chunk kernels.
 # log2(e) rounded to fp32, matching flash-linear-attention.
@@ -212,9 +212,9 @@ def rms_norm_gated(
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for BK in [32]
+        for num_warps in [1]
+        for num_stages in [1]
     ],
     key=["BC", "IS_VARLEN"],
 )
@@ -324,7 +324,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 
 
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1]],
     key=["BK", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -517,10 +517,10 @@ def chunk_kda_scaled_dot_kkt_fwd(
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [64, 128]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for BK in [32]
+        for BV in [32]
+        for num_warps in [1]
+        for num_stages in [1]
     ],
     key=["H", "K", "V", "BT", "IS_VARLEN"],
 )
@@ -690,10 +690,10 @@ def recompute_w_u_fwd(
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [64]
-        for BV in [64]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for BK in [32]
+        for BV in [32]
+        for num_warps in [1]
+        for num_stages in [1]
     ],
     key=["BT", "IS_VARLEN"],
 )
@@ -866,7 +866,7 @@ def softplus_fwd(x):
     configs=[
         triton.Config({"BS": BS}, num_warps=num_warps)
         for BS in BS_LIST
-        for num_warps in [2, 4, 8]
+        for num_warps in [1]
     ],
     key=["H", "S", "BT", "IS_VARLEN"],
 )
@@ -1084,6 +1084,10 @@ def chunk_kda_fwd(
     _H_pr = q.shape[-2]
     _B = q.shape[0]
     _small_grid = _B * _NT_pr * _H_pr <= 256
+    # NPU: the fused kernel (diagonal + inter-solve + recompute) is too heavy
+    # for 910B2 aicore. Force non-fused path which splits into 3 lighter kernels.
+    if "npu" in str(q.device):
+        _small_grid = False
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,

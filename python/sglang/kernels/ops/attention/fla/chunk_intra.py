@@ -37,8 +37,8 @@ else:
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": 64}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
+        for BK in [32]
+        for num_warps in [1]
     ],
     key=["H", "K", "BC", "V", "FUSE_RECOMPUTE", "FUSE_DIAGONAL"],
     **autotune_cache_kwargs,
@@ -789,8 +789,8 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for num_warps in [1]
+        for num_stages in [1]
     ],
     key=["BT", "BC"],
     **autotune_cache_kwargs,
@@ -930,10 +930,7 @@ def chunk_kda_fwd_intra(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
 
-    if fuse_diagonal:
-        Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
-    else:
-        Aqk = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+    Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
     Akkd = torch.empty(B, T, H, BC, device=k.device, dtype=torch.float32)
 
     # Step 1: compute diagonal blocks into Akkd (fp32)

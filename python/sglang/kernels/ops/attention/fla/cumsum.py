@@ -11,7 +11,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.utils import check_shared_mem, input_guard
 
-BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+BS_LIST = [32]
 
 
 # @triton.autotune(
@@ -72,8 +72,8 @@ def chunk_local_cumsum_scalar_kernel(
     configs=[
         triton.Config({"BS": BS}, num_warps=num_warps, num_stages=num_stages)
         for BS in BS_LIST
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for num_warps in [1]
+        for num_stages in [1]
     ],
     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
 )
