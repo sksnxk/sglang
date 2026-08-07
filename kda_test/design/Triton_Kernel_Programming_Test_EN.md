@@ -102,13 +102,28 @@ The three problems form a data-dependency chain: Problem 1's `g_cumsum` → Prob
 
 ### 2.1 Conventions
 
+**Target platform:** Triton-Ascend on Ascend 910B2/910B3.
+
 The following conventions apply to all problems:
 - `B = 1` (single batch, simplified)
 - `BT = 64` (chunk size, each chunk has exactly 64 tokens)
 - `H`, `K`, `V` are compile-time constants given per problem
-- All Triton kernels use **1 warp (32 threads)**, i.e., `num_warps=1`
-- Input tensors are bf16 or fp32; computation uses fp32
+- All Triton kernels use `num_warps=1`. On Ascend, `num_warps` maps a program group to a single AI Core — there is no CUDA-style SIMT warp, but the Triton abstraction handles the mapping transparently.
+- Input tensors are bf16 or fp32; all computation and accumulation uses fp32
 - Fixed-length sequences only (no VARLEN)
+
+**Ascend-specific constraints (mandatory):**
+
+| # | Constraint | Rule |
+|---|-----------|------|
+| C1 | **UB capacity** | All live tile data per kernel iteration must fit in 192 KB (Unified Buffer per AI Core). |
+| C2 | **Grid size** | Grid size ≤ total AI Core count (20 on 910B2, 24 on 910B3). Use the `TRITON_ALL_BLOCKS_PARALLEL=1` environment variable to avoid multi-round scheduling when grid exceeds core count. |
+| C3 | **1D grid preferred** | 2D/3D grids must match physical core topology. Prefer 1D grids and compute multi-dimensional indices manually: `pid_m = pid // num_pid_n; pid_n = pid % num_pid_n`. |
+| C4 | **int64/int32 → scalar fallback** | `tl.arange(0, N)` returns `int64` by default. int64 ADD/CMP and int32 LT/GT/LE/GE comparisons degrade to scalar execution (32-128x slower). Cast to fp32 before any comparison: `cols = tl.arange(0, N).to(tl.float32)`. |
+| C5 | **No break / continue / return** | The Ascend backend does not support early loop exit (`break`), skip (`continue`), or mid-function `return`. Use mask-based iteration instead. |
+| C6 | **Prefer `tl.make_block_ptr`** | Avoid manual pointer arithmetic in `tl.load`/`tl.store` offsets — the Ascend compiler may compute the offset before evaluating the mask, causing DDR out-of-bounds. Use `tl.make_block_ptr` with `boundary_check` and `padding_option="zero"`. |
+| C7 | **Matmul alignment** | For `tl.dot`, the N-dimension tile size × dtype bytes must be a multiple of 512 B. Example: for fp16/bf16 (2 B), BLOCK_N must be a multiple of 256. |
+
 
 ---
 
@@ -632,3 +647,42 @@ assert torch.allclose(o_ref, o_tri.float(), atol=1e-3), "Problem 3 failed"
 
 print("All tests passed!")
 ```
+
+### B. Triton API Quick Reference (with Ascend Notes)
+
+```python
+# Program indexing
+pid = tl.program_id(axis)         # 0/1/2
+# Ascend: prefer 1D grid; compute 2D/3D indices manually:
+#   pid_m = pid // num_pid_n
+#   pid_n = pid % num_pid_n
+
+# Block pointer
+p = tl.make_block_ptr(base, shape, strides, offsets, block_shape, order)
+data = tl.load(p, boundary_check=(axis0, axis1), padding_option="zero")
+tl.store(p, data, boundary_check=(axis0, axis1))
+# Ascend: prefer tl.make_block_ptr over raw pointer arithmetic in offsets.
+#   The compiler may compute offset before evaluating mask for raw pointers,
+#   causing DDR out-of-bounds errors.
+
+# Math operations
+tl.exp(x), tl.exp2(x)             # exponential / base-2 exponential
+tl.cumsum(x, axis=0)              # prefix sum
+tl.dot(a, b)                      # matrix multiply [M,K] @ [K,N] -> [M,N]
+tl.trans(x)                       # transpose
+tl.sum(x, axis=1)                 # sum along axis
+tl.where(cond, a, b)              # conditional selection
+
+# Array construction
+tl.arange(0, N)                   # [0, 1, ..., N-1] -- WARNING: returns int64
+# Ascend: int64/int32 CMP -> scalar fallback. Always cast for mask generation:
+#   idx = tl.arange(0, N).to(tl.float32)
+#   mask = idx < limit             # now uses Vector CMP unit (fp32)
+
+tl.zeros([M, N], dtype=tl.float32)
+tl.full([M, N], value, dtype=tl.int32)
+
+# Constant types
+tl.constexpr                      # compile-time constant marker
+```
+
