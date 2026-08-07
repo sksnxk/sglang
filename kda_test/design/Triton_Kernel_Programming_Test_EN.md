@@ -186,11 +186,11 @@ Compile-time constants: `BT=64` (chunk size), `BS=32` (K-dimension tile size).
 #### Computation Diagram
 
 ```
-Each CTA processes a [BT, BS] = [64, 32] tile:
+Each program processes a [BT, BS] = [64, 32] tile:
 
      K dim (BS=32 channels)
   ┌──────────────────────────────┐
-  │ g[0,0..31]   g[0,32..63]  ...│  ← CTA handles t0..t63, k0..k31
+  │ g[0,0..31]   g[0,32..63]  ...│  ← program handles t0..t63, k0..k31
   │ g[1,0..31]                   │
   │ ...                          │
   │ g[63,0..31]                  │
@@ -253,7 +253,7 @@ This problem corresponds to **Step 2: Token Parallel**. The `g_cumsum` output fr
 
 Implement the `token_parallel` kernel to compute the diagonal Aqk and Akk blocks within each sub-chunk.
 
-**Token-Parallel Strategy:** Each token gets its own CTA. The CTA iterates only over historical tokens within its own sub-chunk (j <= i), avoiding wasted computation.
+**Token-Parallel Strategy:** Each token gets its own program. The program iterates only over historical tokens within its own sub-chunk (j <= i), avoiding wasted computation.
 
 **Why only diagonal blocks?** A 64×64 chunk matrix is partitioned into a 4×4 grid of 16×16 sub-chunk blocks. Off-diagonal blocks are handled by other kernels. This problem only computes the 4 diagonal blocks (D00, D11, D22, D33), each 16×16:
 
@@ -323,13 +323,13 @@ Using Chunk 0, Sub-chunk 1 (tokens 16..31) as an example:
 ```
 Inside D11 block (16×16):
      j=16 j=17 j=18 ... j=31
-i=16 [ C0    X    X  ...  X  ]  ← CTA_16: j=16  (1 pair)
-i=17 [ C1   C2    X  ...  X  ]  ← CTA_17: j=16,17 (2 pairs)
-i=18 [ C3   C4   C5  ...  X  ]  ← CTA_18: j=16,17,18 (3 pairs)
+i=16 [ C0    X    X  ...  X  ]  ← program_16: j=16  (1 pair)
+i=17 [ C1   C2    X  ...  X  ]  ← program_17: j=16,17 (2 pairs)
+i=18 [ C3   C4   C5  ...  X  ]  ← program_18: j=16,17,18 (3 pairs)
  ...                            ...
-i=31 [ ...  ...  ... ...  Cn ]  ← CTA_31: j=16..31 (16 pairs)
+i=31 [ ...  ...  ... ...  Cn ]  ← program_31: j=16..31 (16 pairs)
 
-Each CTA's workload grows linearly with the token's position in the sub-chunk (1..BC pairs).
+Each program's workload grows linearly with the token's position in the sub-chunk (1..BC pairs).
 ```
 
 **Storage Layout:**
