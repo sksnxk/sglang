@@ -147,6 +147,8 @@ def _segment_by_markers(rows, profile_meta):
         torch_us = 0.0
         triton_us = 0.0
         triton_calls = 0
+        triton_durs = []  # 每次 triton 调用的耗时（顺序排列）
+        torch_durs = []   # 每次 torch 调用的耗时（aclnn 拼接段，按顺序）
         triton_op_seen = None
         for name, dur in seg_rows:
             # 匹配某个 kernel 的 triton op 名（前缀匹配，因 op_summary 可能
@@ -160,25 +162,32 @@ def _segment_by_markers(rows, profile_meta):
             if matched is not None:
                 triton_us += dur
                 triton_calls += 1
+                triton_durs.append(dur)
             else:
                 # 排除其他 marker 或非算子行
                 if name == MARKER_NAME:
                     continue
                 torch_us += dur
-        # 从 non_skipped profile_meta 取 case_id / kernel_id（兜底: 用段序号）
+                torch_durs.append(dur)
+        # 从 non_skipped profile_meta 取 case_id / kernel_id / repeats（兜底: 用段序号）
         if i < len(non_skipped):
             pm = non_skipped[i]
             case_id = pm.get("case_id", f"seg{i}")
             kernel_id = pm.get("kernel", f"K{i+1}")
+            repeats = pm.get("repeats", 1)
         else:
             case_id = f"seg{i}"
             kernel_id = f"K{i+1}"
+            repeats = 1
         segments.append({
             "case_id": case_id,
             "kernel_id": kernel_id,
             "torch_us": torch_us,
             "triton_us": triton_us,
             "triton_calls": triton_calls,
+            "triton_durs": triton_durs,
+            "torch_durs": torch_durs,
+            "repeats": repeats,
             "skipped": False,  # 实际有 marker 的段都是非 skipped 的
             "triton_op_seen": triton_op_seen,
         })
@@ -219,6 +228,8 @@ def main(argv=None):
                    help="cases_meta.json 路径（默认 %(default)s）")
     p.add_argument("--out", default=os.path.join(HERE, "results.csv"),
                    help="输出 results.csv 路径（默认 %(default)s）")
+    p.add_argument("--mean", action="store_true",
+                   help="输出每次 repeat 的平均耗时（而非累加和）")
     a = p.parse_args(argv)
 
     # 若有 --csv 用之；否则在 --latest-dir 下合并所有 op_summary slice
@@ -260,10 +271,31 @@ def main(argv=None):
         kid = s["kernel_id"]
         cm = cases_meta.get(cid, {})
         max_diff, status = correctness.get((cid, kid), ("", ""))
-        torch_us = f"{s['torch_us']:.3f}"
-        triton_us = f"{s['triton_us']:.3f}"
-        if s["triton_us"] > 0:
-            speedup = f"{s['torch_us'] / s['triton_us']:.3f}"
+        if a.mean and s["repeats"] > 0:
+            # 仅取最后 repeats 次作为有效 repeat 数据（排除 warmup 的影响）
+            # triton: 每次调用就是一条 op_summary 行，直接取最后 repeats 个
+            tri_durs = s.get("triton_durs", [])
+            if len(tri_durs) >= s["repeats"]:
+                tri_durs = tri_durs[-s["repeats"]:]
+            else:
+                tri_durs = tri_durs
+            # torch: 每个 torch 调用拆成多条 aclnn* 原子 op，无法按 iteration 精确切分。
+            # 用总 aclnn 时长按次数比例折算: 总 torch 时长中有 repeats/(warmup+repeats)
+            # 属于 repeat 阶段。假设 warmup 和 repeat 调用同一算子序列，耗时一致。
+            warmup = s["triton_calls"] - s["repeats"]  # warmup 次数
+            if warmup > 0 and s["repeats"] > 0:
+                total_iters = warmup + s["repeats"]
+                torch_us = s["torch_us"] / total_iters     # 每次 torch 调用的平均
+            else:
+                torch_us = s["torch_us"] / max(s["triton_calls"], 1)
+            triton_us = sum(tri_durs) / len(tri_durs) if tri_durs else 0
+        else:
+            torch_us = s["torch_us"]
+            triton_us = s["triton_us"]
+        torch_us_s = f"{torch_us:.3f}"
+        triton_us_s = f"{triton_us:.3f}"
+        if triton_us > 0:
+            speedup = f"{torch_us / triton_us:.3f}"
         else:
             speedup = "-"
         n_seg += 1
@@ -275,8 +307,8 @@ def main(argv=None):
             "K": cm.get("K", ""),
             "V": cm.get("V", ""),
             "kernel": kid,
-            "torch_us": torch_us,
-            "triton_us": triton_us,
+            "torch_us": torch_us_s,
+            "triton_us": triton_us_s,
             "speedup": speedup,
             "max_diff": max_diff,
             "status": status or "OK",

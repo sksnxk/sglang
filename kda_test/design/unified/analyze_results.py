@@ -15,7 +15,7 @@ import statistics
 from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-KERNEL_ORDER = ["K1", "K2", "K3", "K4", "K5", "K6"]
+KERNEL_ORDER = ["gate_chunk_cumsum", "token_parallel", "inter_solve", "recompute_w_u", "delta_rule_h", "gla_output"]
 
 
 def _load_results(csv_path: str):
