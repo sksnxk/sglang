@@ -2,11 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """统一测试用例表生成器（KDA 6 算子共用）。
 
-按 UNIFIED_BENCH_PLAN.md §3 构造 105 个 case（T 覆盖 1k–128k）:
+构造 106 个 case（T 覆盖 1k–128k）:
   * A 组（T 主扫描，2 的幂）: B∈{1,2,4}, H∈{2,4,8}, T∈{1024..131072} 共 72
   * B 组（T 非 2 幂/边界）  : B=1, H=8, 20 个非对齐 T                       共 20
   * C 组（多 batch 放大）   : B=8, H∈{4,8}, T∈{4096..32768}                共 8
-  * D 组（不支持演示）      : K=V=128 {1024,16384}×H∈{2,8} (4) + K=V=32 {4096,H=4} (1) 共 5
+  * D 组（K=V 扩展 + 目标 case）: K=V=128 {1024,16384}×H∈{2,8} (4) +
+    K=V=32 {4096,H=4} (1) + K=V=128 H=96 T=16384（目标 case）             共 6
+
+K=V=128 下 K5 已支持（K≤256，K=128 走 2D store）；D 组唯一"不支持演示"为
+K=V=32 大 T（K1/K6 仅小 T、K2/K3/K4 BK=32 时 tl.dot 不稳定）。
 
 只写 cases_meta.json（case 表: id→{B,T,H,K,V,group,desc}），**不写张量数据**。
 张量由 bench.py 按固定种子即时生成（见 bench.py::_gen_case_inputs），避免
@@ -60,18 +64,23 @@ def _case_table():
                 f"多 batch 放大: B=8,H={H},T={T}",
             ))
 
-    # D 组：不支持演示（K5 triton 只支持 K=V=64）
+    # D 组：K=V 扩展 + 目标 case（K5 支持 K=V≤256；K=V=128 已支持）
     # D1-D4: K=V=128, T∈{1024,16384}, H∈{2,8}
     for H in (2, 8):
         for T in (1024, 16384):
             cases.append((
                 f"D_KV128_H{H}_T{T}", 1, T, H, 128, 128, "D",
-                f"K=V=128 (K5 不支持): H={H},T={T}",
+                f"K=V=128: H={H},T={T}",
             ))
-    # D5: K=V=32, T=4096, H=4
+    # D5: K=V=32, T=4096, H=4（唯一"不支持演示": K1/K6 仅小T, K2/K3/K4 BK=32 不稳定）
     cases.append((
         "D_KV32_H4_T4096", 1, 4096, 4, 32, 32, "D",
-        "K=V=32 (K5 不支持): H=4,T=4096",
+        "K=V=32 大 T (K1/K6 仅小T, K2/K3/K4 BK=32 不稳定 → 不支持): H=4,T=4096",
+    ))
+    # D6: 目标 case（放在最后，cases_meta.json 中索引 105）
+    cases.append((
+        "D_KV128_H96_T16384", 1, 16384, 96, 128, 128, "D",
+        "K=V=128 (目标 case): H=96,T=16384",
     ))
 
     return cases
@@ -111,7 +120,10 @@ def main(argv=None):
     print(f"groups: {group_str}")
     print(f"T range: [{min(m['T'] for m in meta.values())}, "
           f"{max(m['T'] for m in meta.values())}]")
-    print(f"K=V=64 (K5 支持): {sum(1 for m in meta.values() if m['K']==64)}/{len(meta)}")
+    k5_ok = sum(1 for m in meta.values() if m['K'] == m['V'] and m['K'] <= 256)
+    print(f"K5 支持 (K=V≤256): {k5_ok}/{len(meta)}")
+    print(f"K=V=64: {sum(1 for m in meta.values() if m['K']==64)}")
+    print(f"K=V=128: {sum(1 for m in meta.values() if m['K']==128)}")
 
 
 if __name__ == "__main__":

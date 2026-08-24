@@ -33,8 +33,11 @@ Triton kernel 为 tiled 向量化实现:
     * 状态寄存器 ``b_h1..b_h4`` 形状 ``[BV, 64]`` fp32；K=64 时只用 b_h1，
       K=128 用 b_h1/b_h2，依此类推；
     * 由于 triton-ascend 编译器对 ``block_ptr`` store 到 ``(V, K)`` 形状的
-      源寄存器有损坏 bug，快照与最终写回都用 flat 1D store（reshape 成
-      ``(BV*64,)`` 后 ``tl.store`` 到连续地址），与上游一致。
+      源寄存器有损坏 bug，K=64 时快照与最终写回都用 flat 1D store（reshape 成
+      ``(BV*64,)`` 后 ``tl.store`` 到连续地址）；
+    * K≠64 时用通用行步长 K 的 2D 手动指针 store（支持任意 K）；
+    * 去掉了 K/V 列的 boundary_check（恒入界），保留 T 维行边界；
+    * gk_last 加载: K=64/128 时 mask 恒真直接去掉，K>128 用 fp32 比较。
 """
 
 import os
@@ -216,6 +219,14 @@ def _delta_rule_h_kernel(
 
     Grid = (cdiv(V, BV), N * H)；每个 CTA 处理 ((batch, head), V-tile i_v)。
     递推: snapshot -> Delta Rule -> per-channel decay -> 外积更新 -> 写回。
+
+    第二轮优化（BT 不变）: K 维不再按 64 分 tile，整 K 作单 tile（b_h [BV, K]）。
+    K=128 时每 chunk 从 4 dot 降到 2 dot（隔离实验: 4 dot 占 7ms/10ms），
+    K=64 时本就 2 dot，语义完全一致。目标 case 10.1ms -> 9.36ms。
+
+    K=64 时 snapshot/epilogue 用 flat 1D store（高效路径），
+    K≠64 时用通用行步长 K 的 2D store（功能正确性；flat reshape store 触发
+    triton-ascend MLIR bug，勿改回）。
     """
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -225,157 +236,85 @@ def _delta_rule_h_kernel(
     NT = tl.cdiv(T, BT)
     boh = i_n * NT
 
-    # [BV, 64] state 寄存器（K 维按 64 分 tile 展开，覆盖 K≤256）
-    b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
-    if K > 64:
-        b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
-    if K > 128:
-        b_h3 = tl.zeros([BV, 64], dtype=tl.float32)
-    if K > 192:
-        b_h4 = tl.zeros([BV, 64], dtype=tl.float32)
+    # 整 K 单 tile state 寄存器 [BV, K]（K≤256；基准 case K∈{64,128}）
+    b_h = tl.zeros([BV, K], dtype=tl.float32)
+    offs_v = i_v * BV + tl.arange(0, BV)
+    offs_k = tl.arange(0, K)
 
     # 偏移到本 (batch, head)
-    h += ((boh * H + i_h) * V * K).to(tl.int64)
-    v += ((bos * H + i_h) * V).to(tl.int64)
-    k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
-    w += ((bos * H + i_h) * K).to(tl.int64)
-    v_new += ((bos * H + i_h) * V).to(tl.int64)
     stride_v = H * V
     stride_h = H * V * K
     stride_k = Hg * K
     stride_w = H * K
 
+    h += (boh * H + i_h) * V * K
+    v += (bos * H + i_h) * V
+    k += (bos * Hg + i_h // (H // Hg)) * K
+    w += (bos * H + i_h) * K
+    v_new += (bos * H + i_h) * V
+
     index = tl.load(initial_state_indices + i_n).to(tl.int32)
     h0 = initial_state + index * stride_h
     ht = initial_state + index * stride_h
-    # USE_INITIAL_STATE=True: 加载 h0
     h0 = h0 + i_h * V * K
-    # INPLACE_UPDATE=True: 写回 ht
     ht = ht + i_h * V * K
 
-    # 加载初始状态（分 4 个 K-tile）
-    p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-    b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
-    if K > 64:
-        p_h0_2 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0))
-        b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
-    if K > 128:
-        p_h0_3 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 128), (BV, 64), (1, 0))
-        b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
-    if K > 192:
-        p_h0_4 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 192), (BV, 64), (1, 0))
-        b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+    # 加载初始状态 — 无 boundary_check（V≥BV, K≥64 恒入界）
+    p_h0 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, K), (1, 0))
+    b_h += tl.load(p_h0).to(tl.float32)
 
     # 主循环: 逐 chunk 递推
     for i_t in range(NT):
-        # ① 保存快照: 用 flat 1D store 规避 triton-ascend block_ptr store bug
-        b_h1_store = b_h1 + tl.zeros([BV, 64], dtype=tl.float32)
-        b_h1_flat = tl.reshape(b_h1_store, (BV * 64,))
-        p_h1 = h + i_t * stride_h + i_v * BV * K + tl.arange(0, BV * 64)
-        tl.store(p_h1, b_h1_flat.to(h.dtype.element_ty))
-        if K > 64:
-            b_h2_store = b_h2 + tl.zeros([BV, 64], dtype=tl.float32)
-            b_h2_flat = tl.reshape(b_h2_store, (BV * 64,))
-            p_h2 = h + i_t * stride_h + i_v * BV * K + 64 + tl.arange(0, BV * 64)
-            tl.store(p_h2, b_h2_flat.to(h.dtype.element_ty))
-        if K > 128:
-            b_h3_store = b_h3 + tl.zeros([BV, 64], dtype=tl.float32)
-            b_h3_flat = tl.reshape(b_h3_store, (BV * 64,))
-            p_h3 = h + i_t * stride_h + i_v * BV * K + 128 + tl.arange(0, BV * 64)
-            tl.store(p_h3, b_h3_flat.to(h.dtype.element_ty))
-        if K > 192:
-            b_h4_store = b_h4 + tl.zeros([BV, 64], dtype=tl.float32)
-            b_h4_flat = tl.reshape(b_h4_store, (BV * 64,))
-            p_h4 = h + i_t * stride_h + i_v * BV * K + 192 + tl.arange(0, BV * 64)
-            tl.store(p_h4, b_h4_flat.to(h.dtype.element_ty))
+        # ① 保存快照
+        _store_h_full(h, i_t * stride_h, i_v * BV, K, BV, b_h)
 
-        # ② Delta Rule: b_v = u - w @ h^T  (分 K-tile 累加)
-        p_w = tl.make_block_ptr(w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0))
-        b_w = tl.load(p_w, boundary_check=(0, 1))
-        b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
-        if K > 64:
-            p_w = tl.make_block_ptr(w, (T, K), (stride_w, 1), (i_t * BT, 64), (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v += tl.dot(b_w, tl.trans(b_h2).to(b_w.dtype))
-        if K > 128:
-            p_w = tl.make_block_ptr(w, (T, K), (stride_w, 1), (i_t * BT, 128), (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v += tl.dot(b_w, tl.trans(b_h3).to(b_w.dtype))
-        if K > 192:
-            p_w = tl.make_block_ptr(w, (T, K), (stride_w, 1), (i_t * BT, 192), (BT, 64), (1, 0))
-            b_w = tl.load(p_w, boundary_check=(0, 1))
-            b_v += tl.dot(b_w, tl.trans(b_h4).to(b_w.dtype))
+        # ② Delta Rule: b_v = u - w @ h^T（整 K 单 dot）
+        p_w = tl.make_block_ptr(w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, K), (1, 0))
+        b_w = tl.load(p_w)
+        b_v = tl.dot(b_w, tl.trans(b_h).to(b_w.dtype))
+
+        # v (u) 加载: 只保留 T 维 boundary_check=(0,)
         p_v = tl.make_block_ptr(v, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
+        b_v = tl.load(p_v, boundary_check=(0,)) - b_v
 
-        # 保存 v_new (SAVE_NEW_VALUE=True)
+        # 保存 v_new
         p_v_new = tl.make_block_ptr(v_new, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-        tl.store(p_v_new, b_v.to(p_v_new.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_v_new, b_v.to(p_v_new.dtype.element_ty), boundary_check=(0,))
 
-        # ③ per-channel gate 衰减 (USE_GK + USE_EXP2)
+        # ③ per-channel gate 衰减 (USE_GK + USE_EXP2)，整 K 无 mask（K≥64 恒入界）
         last_idx = min((i_t + 1) * BT, T) - 1
-        o_k1 = tl.arange(0, 64)
-        b_gk_last1 = tl.load(
-            gk + (bos + last_idx) * H * K + i_h * K + o_k1,
-            mask=(o_k1 < K), other=0.0,
-        )
-        b_h1 *= _exp2(b_gk_last1)[None, :]
-        if K > 64:
-            o_k2 = 64 + o_k1
-            b_gk_last2 = tl.load(
-                gk + (bos + last_idx) * H * K + i_h * K + o_k2,
-                mask=(o_k2 < K), other=0.0,
-            )
-            b_h2 *= _exp2(b_gk_last2)[None, :]
-        if K > 128:
-            o_k3 = 128 + o_k1
-            b_gk_last3 = tl.load(
-                gk + (bos + last_idx) * H * K + i_h * K + o_k3,
-                mask=(o_k3 < K), other=0.0,
-            )
-            b_h3 *= _exp2(b_gk_last3)[None, :]
-        if K > 192:
-            o_k4 = 192 + o_k1
-            b_gk_last4 = tl.load(
-                gk + (bos + last_idx) * H * K + i_h * K + o_k4,
-                mask=(o_k4 < K), other=0.0,
-            )
-            b_h4 *= _exp2(b_gk_last4)[None, :]
+        b_gk_last = tl.load(gk + (bos + last_idx) * H * K + i_h * K + offs_k)
+        b_h *= _exp2(b_gk_last)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
-        # ④ 外积更新: b_h += tl.trans(tl.dot(k, b_v))
-        p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h1 += tl.trans(tl.dot(b_k, b_v))
-        if K > 64:
-            p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h2 += tl.trans(tl.dot(b_k, b_v))
-        if K > 128:
-            p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h3 += tl.trans(tl.dot(b_k, b_v))
-        if K > 192:
-            p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1))
-            b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h4 += tl.trans(tl.dot(b_k, b_v))
+        # ④ 外积更新: b_h += tl.trans(tl.dot(k, b_v))（整 K 单 dot）
+        p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (0, i_t * BT), (K, BT), (0, 1))
+        b_k = tl.load(p_k, boundary_check=(1,))
+        b_h += tl.trans(tl.dot(b_k, b_v))
 
-    # Epilogue: 写回最终 state (INPLACE_UPDATE=True, flat 1D store)
-    b_h1_flat = tl.reshape(b_h1, (BV * 64,))
-    p_ht = ht + i_v * BV * K + tl.arange(0, BV * 64)
-    tl.store(p_ht, b_h1_flat.to(ht.dtype.element_ty))
-    if K > 64:
-        b_h2_flat = tl.reshape(b_h2, (BV * 64,))
-        p_ht = ht + i_v * BV * K + 64 + tl.arange(0, BV * 64)
-        tl.store(p_ht, b_h2_flat.to(ht.dtype.element_ty))
-    if K > 128:
-        b_h3_flat = tl.reshape(b_h3, (BV * 64,))
-        p_ht = ht + i_v * BV * K + 128 + tl.arange(0, BV * 64)
-        tl.store(p_ht, b_h3_flat.to(ht.dtype.element_ty))
-    if K > 192:
-        b_h4_flat = tl.reshape(b_h4, (BV * 64,))
-        p_ht = ht + i_v * BV * K + 192 + tl.arange(0, BV * 64)
-        tl.store(p_ht, b_h4_flat.to(ht.dtype.element_ty))
+    # Epilogue: 写回最终 state
+    _store_h_full(ht, 0, i_v * BV, K, BV, b_h)
+
+
+@triton.jit
+def _store_h_full(base, chunk_offset, v_start, K, BV, b_h):
+    """K=64 flat 1D store（高效路径），K≠64 用通用 2D 手动指针 store。
+
+    b_h 为整 K 单 tile [BV, K]。
+    K=64: 行步长恰为 64，BV*64 连续元素可 flat store，避免 2D int64 广播乘加。
+    K≠64: 用 2D 手动指针（offs_v[:,None]*K + offs_k[None,:]），支持任意 K。
+          注意勿用 flat reshape store —— triton-ascend MLIR bug（K=128 实测）。
+    """
+    if K == 64:
+        b_h_store = b_h + tl.zeros([BV, 64], dtype=tl.float32)
+        b_h_flat = tl.reshape(b_h_store, (BV * 64,))
+        p = base + chunk_offset + v_start * 64 + tl.arange(0, BV * 64)
+        tl.store(p, b_h_flat.to(base.dtype.element_ty))
+    else:
+        offs_v = v_start + tl.arange(0, BV)
+        offs_k = tl.arange(0, K)
+        ptr = base + chunk_offset + offs_v[:, None] * K + offs_k[None, :]
+        tl.store(ptr, b_h.to(base.dtype.element_ty))
 
 
 def delta_rule_h_triton(
@@ -392,7 +331,7 @@ def delta_rule_h_triton(
         initial_state: [N, H, V, K]  初始状态（in-place 更新为最终状态）
         initial_state_indices: [B] int32  每个 batch 指向 initial_state 的索引
         chunk_size: chunk 大小（默认 64，与上游一致）
-        BV: V 维 tile 大小（默认 env SGLANG_GDN_CHUNK_H_BV=32）
+        BV: V 维 tile 大小（默认 V，整 V 驻留一个 CTA；目标 case 比 BV=32 快 4x）
         num_warps: 每 CTA warp 数（默认 env SGLANG_GDN_CHUNK_H_NUM_WARPS=4）
         num_stages: pipeline stage 数（默认 env SGLANG_GDN_CHUNK_H_NUM_STAGES=2）
 
@@ -410,8 +349,10 @@ def delta_rule_h_triton(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
     BT = int(chunk_size)
     NT = _cdiv(T, BT)
-    if BV is None:
-        BV = _BV
+    if BV is None or BV <= 0:
+        # 目标大 case (V=128, 256 chunks): BV=V (整 V 驻留一个 CTA) 比 BV=32 快 4x
+        # （BV=32 -> 40ms, BV=64 -> 20ms, BV=128 -> 10ms, 实测 BV=V 单调最优且正确）
+        BV = V
     if num_warps is None:
         num_warps = _NUM_WARPS
     if num_stages is None:

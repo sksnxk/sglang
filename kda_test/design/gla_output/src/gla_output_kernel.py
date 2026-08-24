@@ -57,7 +57,7 @@ RCP_LN2 = 1.4426950216293335
 # 编译期 tile 大小。BT 即 chunk_size；BK 为 K 维 tile，BV 为 V 维 tile。
 _DEFAULT_BT = 64
 _DEFAULT_BK = 32
-_DEFAULT_BV = 32
+_DEFAULT_BV = 128
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -235,16 +235,6 @@ def gla_output_torch(
 # ---------------------------------------------------------------------------
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32]
-        for BV in [32]
-        for num_warps in [1]
-        for num_stages in [1]
-    ],
-    key=["BT"],
-)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
     q,
@@ -262,15 +252,18 @@ def chunk_gla_fwd_kernel_o(
     BK: tl.constexpr,
     BV: tl.constexpr,
 ):
-    """KDA GLA Output triton kernel（固定长度模式，无 VARLEN）。
+    """Route B: 手动指针算术替换 tl.make_block_ptr。
 
     grid = (cdiv(V, BV), NT, B * H)，每个 program 处理一个
     ``(V-tile, chunk, (batch, head))`` 交集，输出 ``[BT, BV]`` 子块:
-      * K 维 sequential loop: 加载 [BT,BK] q/g + [BV,BK] h，
-        ``b_o += dot(q_gated, h^T)``  (跨块路径);
-      * 块内: 加载 [BT,BT] Aqk (施加下三角 mask) + [BT,BV] v_new，
-        ``b_o += dot(A_masked, v_new)``  (块内路径);
-      * fp32 累加器写出 (cast 回存储精度)。
+      * 所有 tensor 访问均通过 base + offset 手动计算，不使用 block_ptr；
+      * 显式构造 row/col mask 做 boundary check；
+      * fp32 因果 mask；
+      * 数学上与原始实现完全等价。
+
+    第二轮优化: 跨块 K 循环的 BK 由 driver 控制（BK=min(K,128)，num_warps=2）。
+    目标 case K=128 时 BK 32->128 把 4 个串行小 dot 合并为 1 个 [64,128]@[128,128]，
+    8.2ms -> 6.8ms（隔离实验确认串行 K 循环是瓶颈）。
     """
     i_v = tl.program_id(0)   # V 维 tile 索引
     i_t = tl.program_id(1)   # chunk 索引
@@ -281,60 +274,59 @@ def chunk_gla_fwd_kernel_o(
     NT = tl.cdiv(T, BT)
     i_tg = i_b * NT + i_t    # 全局 tile 索引（用于访问 h）
     bos = i_b * T
-    eos = bos + T
 
-    # 下三角因果 mask: m_s[i, j] = (i >= j)
-    m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
+    # 编译期 strides
+    s_q_t: tl.constexpr = H * K       # q/g 在 T 维的 stride
+    s_v_t: tl.constexpr = H * V       # v/o 在 T 维的 stride
+    s_h_v: tl.constexpr = K           # h 在 V 维的 stride
+    s_a_t: tl.constexpr = H * BT      # A 在 T 维的 stride
+
+    # 下三角因果 mask: m_s[i, j] = (i >= j)  (fp32)
+    m_s = tl.arange(0, BT)[:, None].to(tl.float32) >= tl.arange(0, BT)[None, :].to(tl.float32)
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
 
-    # ── 跨块路径: K 维 sequential loop ──
+    # ── 跨块路径: K 维 sequential loop (手动指针算术) ──
     for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(
-            q + (bos * H + i_h) * K,
-            (T, K), (H * K, 1),
-            (i_t * BT, i_k * BK), (BT, BK), (1, 0),
-        )
-        p_g = tl.make_block_ptr(
-            g + (bos * H + i_h) * K,
-            (T, K), (H * K, 1),
-            (i_t * BT, i_k * BK), (BT, BK), (1, 0),
-        )
-        p_h = tl.make_block_ptr(
-            h + (i_tg * H + i_h) * V * K,
-            (V, K), (K, 1),
-            (i_v * BV, i_k * BK), (BV, BK), (1, 0),
-        )
-        b_q = tl.load(p_q, boundary_check=(0, 1))
+        # q/g tile: [BT, BK]  —  base = q[b, 0, h, 0] + i_t*BT*s_q_t + i_k*BK
+        q_offs = tl.arange(0, BT)[:, None] * s_q_t + tl.arange(0, BK)[None, :]
+        q_mask = (i_t * BT + tl.arange(0, BT)[:, None] < T) & (i_k * BK + tl.arange(0, BK)[None, :] < K)
+        b_q = tl.load(q + (bos * H + i_h) * K + i_t * BT * s_q_t + i_k * BK + q_offs,
+                      mask=q_mask, other=0.0)
         b_q = (b_q * scale).to(b_q.dtype)
-        b_g = tl.load(p_g, boundary_check=(0, 1))
+
+        b_g = tl.load(g + (bos * H + i_h) * K + i_t * BT * s_q_t + i_k * BK + q_offs,
+                      mask=q_mask, other=0.0)
         b_qg = (b_q * tl.math.exp2(b_g)).to(b_q.dtype)
-        b_h = tl.load(p_h, boundary_check=(0, 1))
-        # [BT, BK] @ [BK, BV] = [BT, BV]  (h 按 [V,K] 布局，需转置)
+
+        # h tile: [BV, BK]  —  base = h[i_tg, i_h, 0, 0] + i_v*BV*s_h_v + i_k*BK
+        h_offs = tl.arange(0, BV)[:, None] * s_h_v + tl.arange(0, BK)[None, :]
+        h_mask = (i_v * BV + tl.arange(0, BV)[:, None] < V) & (i_k * BK + tl.arange(0, BK)[None, :] < K)
+        b_h = tl.load(h + (i_tg * H + i_h) * V * K + i_v * BV * s_h_v + i_k * BK + h_offs,
+                      mask=h_mask, other=0.0)
+
         b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
 
     # ── 块内路径: Aqk @ v_new (causal) ──
-    p_v = tl.make_block_ptr(
-        v + (bos * H + i_h) * V,
-        (T, V), (H * V, 1),
-        (i_t * BT, i_v * BV), (BT, BV), (1, 0),
-    )
-    p_o = tl.make_block_ptr(
-        o + (bos * H + i_h) * V,
-        (T, V), (H * V, 1),
-        (i_t * BT, i_v * BV), (BT, BV), (1, 0),
-    )
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT,
-        (T, BT), (H * BT, 1),
-        (i_t * BT, 0), (BT, BT), (1, 0),
-    )
-    b_v = tl.load(p_v, boundary_check=(0, 1))
-    b_A = tl.load(p_A, boundary_check=(0, 1))
+    # v tile: [BT, BV]  —  base = v[b, 0, h, 0] + i_t*BT*s_v_t + i_v*BV
+    v_offs = tl.arange(0, BT)[:, None] * s_v_t + tl.arange(0, BV)[None, :]
+    v_mask = (i_t * BT + tl.arange(0, BT)[:, None] < T) & (i_v * BV + tl.arange(0, BV)[None, :] < V)
+    b_v = tl.load(v + (bos * H + i_h) * V + i_t * BT * s_v_t + i_v * BV + v_offs,
+                  mask=v_mask, other=0.0)
+
+    # A tile: [BT, BT]  —  base = A[b, 0, h, 0] + i_t*BT*s_a_t
+    A_offs = tl.arange(0, BT)[:, None] * s_a_t + tl.arange(0, BT)[None, :]
+    A_mask = i_t * BT + tl.arange(0, BT)[:, None] < T
+    b_A = tl.load(A + (bos * H + i_h) * BT + i_t * BT * s_a_t + A_offs,
+                  mask=A_mask, other=0.0)
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v)
 
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    # ── Store: [BT, BV] ──
+    o_offs = tl.arange(0, BT)[:, None] * s_v_t + tl.arange(0, BV)[None, :]
+    o_mask = (i_t * BT + tl.arange(0, BT)[:, None] < T) & (i_v * BV + tl.arange(0, BV)[None, :] < V)
+    tl.store(o + (bos * H + i_h) * V + i_t * BT * s_v_t + i_v * BV + o_offs,
+             b_o.to(o.dtype.element_ty), mask=o_mask)
 
 
 def gla_output_kernel(
@@ -383,8 +375,11 @@ def gla_output_kernel(
         out_dtype = q.dtype
     o = torch.empty(B, T, H, V, dtype=out_dtype, device=q.device)
 
-    BK = _DEFAULT_BK
+    # BK=min(K,128): 目标 case K=128 时 4 个小 dot 合并为 1 个；K<128 用整 K。
+    # num_warps: BK=128 用 2（隔离实验最优），小 BK 用 1。
+    BK = 128 if K >= 128 else K
     BV = _DEFAULT_BV
+    nw = 2 if BK >= 128 else 1
     grid = (_cdiv(V, BV), NT, B * H)
 
     chunk_gla_fwd_kernel_o[grid](
@@ -400,6 +395,10 @@ def gla_output_kernel(
         K=K,
         V=V,
         BT=BT,
+        BK=BK,
+        BV=BV,
+        num_warps=nw,
+        num_stages=1,
     )
     torch.npu.synchronize()
     return o

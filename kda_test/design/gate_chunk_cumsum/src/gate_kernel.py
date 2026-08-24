@@ -56,10 +56,15 @@ import triton.language as tl
 # log2(e) = 1 / ln(2)，取 fp32 下的精确值（与 flash-linear-attention 一致）。
 RCP_LN2 = 1.4426950216293335
 
-# 编译期 tile 大小。BT 即 chunk_size；BS 为通道维 tile 大小（本 kernel 固定 32）。
+# 编译期 tile 大小。BT 即 chunk_size；BS 为通道维 tile 大小。
 # tl.cumsum 需要这两个值都是 2 的幂。
 _DEFAULT_BT = 64
-_DEFAULT_BS = 32
+# 优化记录（见 OPTIMIZATION_LOG.md）: BS 从 32 增大到 64 以降低展平后 grid
+# 大小（cdiv(K,BS) 从 4→2）。目标 CASE B=1,T=16384,H=96,K=128 下
+# grid = (2, 256, 96) → 展平 49152 ≤ 65535，消除 grid 超限不支持问题。
+# 第二轮优化: BS 从 64 增大到 128, cdiv(K,BS) 从 2→1, grid = (1,256,96)
+# → 展平 24576, speedup 从 ~3.1x 提升到 ~7.0x (torch_npu baseline)。
+_DEFAULT_BS = 128
 _SOFTPLUS_THRESHOLD = 20.0
 
 

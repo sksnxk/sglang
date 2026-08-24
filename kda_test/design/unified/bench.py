@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """KDA 6 算子统一 bench: 正确性（模式 A）+ msprof 分段采集（模式 B）。
 
-数据流（每个 case，见 UNIFIED_BENCH_PLAN.md §4.1）:
+数据流（每个 case，见 README.md §4）:
     g       = K1_torch(x, A_log, dt_bias)                          # [B,T,H,K]
     Aqk_d, Akk  = K2_torch(q, k, g, beta, scale)                   # [B,T,H,BT],[B,T,H,BC]
     Aqk_nd, Akk_inv = K3_torch(q, k, g, beta, Akkd=Akk, scale)     # [B,T,H,BT],[B,T,H,BT]
@@ -272,15 +272,15 @@ def _kernel_grid_size(kernel_id, B, T, H, K, V):
     """
     BT = _BT
     if kernel_id == "K1":
-        return _cdiv(K, 32) * _cdiv(T, BT) * (B * H)
+        return _cdiv(K, 128) * _cdiv(T, BT) * (B * H)  # BS=128 (见 gate_kernel.py OPTIMIZATION_LOG.md 第二轮优化)
     if kernel_id == "K2":
-        return (B * T) * H
+        return _cdiv(T, BT) * (B * H)  # chunked grid: (B*cdiv(T,BT), H)
     if kernel_id in ("K3", "K4"):
         return _cdiv(T, BT) * (B * H)
     if kernel_id == "K5":
         return _cdiv(V, 32) * (B * H)
     if kernel_id == "K6":
-        return _cdiv(V, 32) * _cdiv(T, BT) * (B * H)
+        return _cdiv(V, 128) * _cdiv(T, BT) * (B * H)  # BV=128
     return 0
 
 
@@ -292,7 +292,8 @@ def _kernel_supports(kernel_id, B, T, H, K, V):
         不能超过 NPU coreDim 上限 65535 (rtKernelLaunch 报 ERR00100
         "value 65536 for parameter coreDim is invalid"), 否则 kernel 启动
         失败并可能污染 NPU 设备状态 (导致后续 kernel/torch_npu 算子也失败)。
-      * K5 (delta_rule_h): 仅支持 K=V=64 (flat 1D store 假定行步长 K=64)
+      * K5 (delta_rule_h): 要求 K==V 且 K≤256 (K=128 已支持; K=64 走 flat 1D store,
+        K≠64 走 2D store)
       * K=32: K2/K3/K4 tl.dot 在 BK=32 时不稳定; K1/K6 大 T 下精度不足
     """
     # 1) 展平 grid 上限 (所有 kernel 通用)
@@ -302,10 +303,12 @@ def _kernel_supports(kernel_id, B, T, H, K, V):
             f"{kernel_id} grid(flattened)={grid_size} 超过 NPU coreDim 上限 "
             f"{_NPU_CORE_DIM_MAX}"
         )
-    # 2) K5 K=V=64 约束
+    # 2) K5 K=V 约束 (已修复 K=128, 支持 K≤256)
     if kernel_id == "K5":
-        if K != 64 or V != 64:
-            return False, f"K5 triton 仅支持 K=V=64, 实际 K={K},V={V}"
+        if K != V:
+            return False, f"K5 要求 K==V, 实际 K={K},V={V}"
+        if K > 256:
+            return False, f"K5 仅支持 K≤256, 实际 K={K}"
     # 3) K=32 精度/稳定性约束
     if K == 32:
         if kernel_id in ("K2", "K3", "K4"):
@@ -466,7 +469,7 @@ def run_msprof(meta_path, repeats=5, warmup=2, limit=0, group=None, start=0):
                 })
                 continue
 
-            # ── marker: case,kernel 段开始 ──
+            # ── marker: case,kernel torch 段开始 ──
             _emit_marker(device)
             # warmup + repeats: torch
             try:
@@ -480,6 +483,8 @@ def run_msprof(meta_path, repeats=5, warmup=2, limit=0, group=None, start=0):
                     for _ in range(repeats):
                         init_torch.copy_(backup)
                         _call_kernel(kid, "torch", kernels_in)
+                    # ── marker: torch 段结束 / triton 段开始 ──
+                    _emit_marker(device)
                     for _ in range(warmup):
                         init_triton.copy_(backup)
                         _call_kernel(kid, "triton", kernels_in)
@@ -494,6 +499,8 @@ def run_msprof(meta_path, repeats=5, warmup=2, limit=0, group=None, start=0):
                         _call_kernel(kid, "torch", kernels_in)
                     for _ in range(repeats):
                         _call_kernel(kid, "torch", kernels_in)
+                    # ── marker: torch 段结束 / triton 段开始 ──
+                    _emit_marker(device)
                     for _ in range(warmup):
                         _call_kernel(kid, "triton", kernels_in)
                     for _ in range(repeats):

@@ -19,10 +19,16 @@
 set -e
 
 # 容器内 CANN 环境
-: "${SET_ENV:=/usr/local/Ascend/ascend-toolkit/set_env.sh}"
+: "${SET_ENV:=/usr/local/Ascend/ascend-toolkit/8.2.RC1/aarch64-linux/script/set_env.sh}"
 if [ -f "$SET_ENV" ]; then
   # shellcheck disable=SC1090
   source "$SET_ENV"
+fi
+
+# also source bisheng toolkit for bishengir-compile
+BISHENG_SET_ENV="/usr/local/Ascend/ascend-toolkit/8.2.RC1/bisheng_toolkit/set_env.sh"
+if [ -f "$BISHENG_SET_ENV" ]; then
+  source "$BISHENG_SET_ENV"
 fi
 
 # triton-ascend 需要 torch/torch_npu 的动态库在 LD_LIBRARY_PATH

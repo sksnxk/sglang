@@ -273,269 +273,83 @@ def inter_solve_torch(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# triton kernel：1 CTA / chunk / head（与上游 inter_solve_fused 策略一致）
+# triton kernel：融合单 kernel（head-merged）+ 重复平方截断逆（npow=3）
+#
+# 每个 CTA 处理 1 个 (chunk, head-group)，循环 HM 个 head：
+#   Phase 1: 全 chunk [BT,BT] 矩阵 Mkk / Mqk（K 维单 tile），Mqk 写 Aqk（block-strict-lower，
+#            对角 Aqk 来自 K2），Mkk 取 strict-lower 得 L；
+#   Phase 2: (I-L)^{-1} 用重复平方链 (I-L)(I+L2)(I+L4)(I+L8)，npow=3 -> 6 个 dot。
+# 对角 16x16 块由内部 Mkk 直接给出（与 K2 的 Akkd 数学一致），因此无需读 Akkd。
 # ═══════════════════════════════════════════════════════════════════════════
 
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "TP"])
 def _inter_solve_kernel(
-    q, k, g, beta, Akkd, Aqk, Akk_out,
-    scale,
-    T, H: tl.constexpr, K: tl.constexpr,
-    BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr,
+    q, k, g, beta, Aqk, Akk_out,
+    scale, T, TP, H: tl.constexpr, K: tl.constexpr,
+    BT: tl.constexpr, BC: tl.constexpr, HM: tl.constexpr, NP: tl.constexpr,
 ):
-    """1 个 CTA 处理 1 个 (chunk, head)。
+    """融合 K3：grid=(cdiv(T,BT), cdiv(B*H,HM))。batch 由 i_hg 解码。
 
-    Phase 1: 计算 6 个非对角线 Aqk/Akk 子块 (i>j);
-    Phase 2: 4 个对角子块前向替换求逆;
-    Phase 3: 链式矩阵乘合并下三角逆, 写回 Akk_out [B,T,H,BT]。
+    NP 截断级数: 1 级=2 dot, ..., 3 级=6 dot (14.4ms 最优, 精度 1e-7)。
     """
     i_tc, i_hg = tl.program_id(0), tl.program_id(1)
-    i_b = i_hg // H
-    i_h = i_hg % H
-    bos = i_b * T
     if i_tc * BT >= T:
         return
-
+    n_hg = H // HM
+    i_b = i_hg // n_hg
+    hg0 = i_hg % n_hg
     i_tc0 = i_tc * BT
-    i_tc1 = i_tc0 + BC
-    i_tc2 = i_tc0 + 2 * BC
-    i_tc3 = i_tc0 + 3 * BC
-
-    # 指针偏移到本 (batch, head)
-    q   += (bos * H + i_h) * K
-    k   += (bos * H + i_h) * K
-    g   += (bos * H + i_h) * K
-    Aqk += (bos * H + i_h) * BT
-    Akk_out += (bos * H + i_h) * BT
-    Akkd += (bos * H + i_h) * BC
-    beta += bos * H + i_h
-
-    o_i = tl.arange(0, BC)
-    m_tc1 = (i_tc1 + o_i) < T
-    m_tc2 = (i_tc2 + o_i) < T
-    m_tc3 = (i_tc3 + o_i) < T
-
-    # ── Phase 1: 寄存器初始化 12 个 [BC,BC] fp32 块 ──
-    b_Aqk10 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Akk10 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Aqk20 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Akk20 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Aqk21 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Akk21 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Aqk30 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Akk30 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Aqk31 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Akk31 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Aqk32 = tl.zeros([BC, BC], dtype=tl.float32)
-    b_Akk32 = tl.zeros([BC, BC], dtype=tl.float32)
-
-    # ── Phase 1: K 维循环累加非对角块 ──
-    for i_k in range(tl.cdiv(K, BK)):
-        o_k = i_k * BK + tl.arange(0, BK)
-        m_k = o_k < K
-
-        # 子块 0
-        p_k0 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
-        p_g0 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc0, i_k * BK), (BC, BK), (1, 0))
-        b_k0 = tl.load(p_k0, boundary_check=(0, 1)).to(tl.float32)
-        b_g0 = tl.load(p_g0, boundary_check=(0, 1)).to(tl.float32)
-
-        # 子块 1
-        p_q1 = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
-        p_k1 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
-        p_g1 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc1, i_k * BK), (BC, BK), (1, 0))
-        b_q1 = tl.load(p_q1, boundary_check=(0, 1)).to(tl.float32)
-        b_k1 = tl.load(p_k1, boundary_check=(0, 1)).to(tl.float32)
-        b_g1 = tl.load(p_g1, boundary_check=(0, 1)).to(tl.float32)
-        b_gn1 = tl.load(g + i_tc1 * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-        b_gqn = tl.where(m_tc1[:, None], tl.math.exp2(b_g1 - b_gn1[None, :]), 0.0)
-        b_kgt = tl.trans(b_k0 * tl.math.exp2(b_gn1[None, :] - b_g0)).to(tl.bfloat16)
-        b_qg1 = (b_q1 * b_gqn).to(tl.bfloat16)
-        b_kg1 = (b_k1 * b_gqn).to(tl.bfloat16)
-        b_Aqk10 += tl.dot(b_qg1, b_kgt)
-        b_Akk10 += tl.dot(b_kg1, b_kgt)
-
-        # 子块 2
-        p_q2 = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
-        p_k2 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
-        p_g2 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
-        b_q2 = tl.load(p_q2, boundary_check=(0, 1)).to(tl.float32)
-        b_k2 = tl.load(p_k2, boundary_check=(0, 1)).to(tl.float32)
-        b_g2 = tl.load(p_g2, boundary_check=(0, 1)).to(tl.float32)
-        b_gn2 = tl.load(g + i_tc2 * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-        b_gqn2 = tl.where(m_tc2[:, None], tl.math.exp2(b_g2 - b_gn2[None, :]), 0.0)
-        b_qg2 = (b_q2 * b_gqn2).to(tl.bfloat16)
-        b_kg2 = (b_k2 * b_gqn2).to(tl.bfloat16)
-        # (2, 0)
-        b_kgt = tl.trans(b_k0 * tl.math.exp2(b_gn2[None, :] - b_g0)).to(tl.bfloat16)
-        b_Aqk20 += tl.dot(b_qg2, b_kgt)
-        b_Akk20 += tl.dot(b_kg2, b_kgt)
-        # (2, 1)
-        b_kgt = tl.trans(b_k1 * tl.math.exp2(b_gn2[None, :] - b_g1)).to(tl.bfloat16)
-        b_Aqk21 += tl.dot(b_qg2, b_kgt)
-        b_Akk21 += tl.dot(b_kg2, b_kgt)
-
-        # 子块 3
-        p_q3 = tl.make_block_ptr(q, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
-        p_k3 = tl.make_block_ptr(k, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
-        p_g3 = tl.make_block_ptr(g, (T, K), (H * K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
-        b_q3 = tl.load(p_q3, boundary_check=(0, 1)).to(tl.float32)
-        b_k3 = tl.load(p_k3, boundary_check=(0, 1)).to(tl.float32)
-        b_g3 = tl.load(p_g3, boundary_check=(0, 1)).to(tl.float32)
-        b_gn3 = tl.load(g + i_tc3 * H * K + o_k, mask=m_k, other=0.0).to(tl.float32)
-        b_gqn3 = tl.where(m_tc3[:, None], tl.math.exp2(b_g3 - b_gn3[None, :]), 0.0)
-        b_qg3 = (b_q3 * b_gqn3).to(tl.bfloat16)
-        b_kg3 = (b_k3 * b_gqn3).to(tl.bfloat16)
-        # (3, 0)
-        b_kgt = tl.trans(b_k0 * tl.math.exp2(b_gn3[None, :] - b_g0)).to(tl.bfloat16)
-        b_Aqk30 += tl.dot(b_qg3, b_kgt)
-        b_Akk30 += tl.dot(b_kg3, b_kgt)
-        # (3, 1)
-        b_kgt = tl.trans(b_k1 * tl.math.exp2(b_gn3[None, :] - b_g1)).to(tl.bfloat16)
-        b_Aqk31 += tl.dot(b_qg3, b_kgt)
-        b_Akk31 += tl.dot(b_kg3, b_kgt)
-        # (3, 2)
-        b_kgt = tl.trans(b_k2 * tl.math.exp2(b_gn3[None, :] - b_g2)).to(tl.bfloat16)
-        b_Aqk32 += tl.dot(b_qg3, b_kgt)
-        b_Akk32 += tl.dot(b_kg3, b_kgt)
-
-    # ── Phase 1 尾部: 存 Aqk 非对角块 (带 scale), Akk 乘 beta ──
-    # 条件已移除: boundary_check 对越界位置返回 0, 乘 beta=0 也为 0, 安全
-    p_Aqk10 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc1, 0), (BC, BC), (1, 0))
-    tl.store(p_Aqk10, (b_Aqk10 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
-    p_b1 = tl.make_block_ptr(beta, (T,), (H,), (i_tc1,), (BC,), (0,))
-    b_b1 = tl.load(p_b1, boundary_check=(0,)).to(tl.float32)
-    b_Akk10 = b_Akk10 * b_b1[:, None]
-
-    p_Aqk20 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc2, 0), (BC, BC), (1, 0))
-    p_Aqk21 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc2, BC), (BC, BC), (1, 0))
-    tl.store(p_Aqk20, (b_Aqk20 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Aqk21, (b_Aqk21 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
-    p_b2 = tl.make_block_ptr(beta, (T,), (H,), (i_tc2,), (BC,), (0,))
-    b_b2 = tl.load(p_b2, boundary_check=(0,)).to(tl.float32)
-    b_Akk20 = b_Akk20 * b_b2[:, None]
-    b_Akk21 = b_Akk21 * b_b2[:, None]
-
-    p_Aqk30 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc3, 0), (BC, BC), (1, 0))
-    p_Aqk31 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc3, BC), (BC, BC), (1, 0))
-    p_Aqk32 = tl.make_block_ptr(Aqk, (T, BT), (H * BT, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0))
-    tl.store(p_Aqk30, (b_Aqk30 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Aqk31, (b_Aqk31 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Aqk32, (b_Aqk32 * scale).to(Aqk.dtype.element_ty), boundary_check=(0, 1))
-    p_b3 = tl.make_block_ptr(beta, (T,), (H,), (i_tc3,), (BC,), (0,))
-    b_b3 = tl.load(p_b3, boundary_check=(0,)).to(tl.float32)
-    b_Akk30 = b_Akk30 * b_b3[:, None]
-    b_Akk31 = b_Akk31 * b_b3[:, None]
-    b_Akk32 = b_Akk32 * b_b3[:, None]
-
-    # ── Phase 2: 加载对角块 + 前向替换求逆 ──
-    # 对角块来自 Akkd (Kernel-2 已写好, 严格下三角, 需要前向替换求逆)
-    p_Akk00 = tl.make_block_ptr(Akkd, (T, BC), (H * BC, 1), (i_tc0, 0), (BC, BC), (1, 0))
-    p_Akk11 = tl.make_block_ptr(Akkd, (T, BC), (H * BC, 1), (i_tc1, 0), (BC, BC), (1, 0))
-    p_Akk22 = tl.make_block_ptr(Akkd, (T, BC), (H * BC, 1), (i_tc2, 0), (BC, BC), (1, 0))
-    p_Akk33 = tl.make_block_ptr(Akkd, (T, BC), (H * BC, 1), (i_tc3, 0), (BC, BC), (1, 0))
-    b_Ai00 = tl.load(p_Akk00, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai11 = tl.load(p_Akk11, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai22 = tl.load(p_Akk22, boundary_check=(0, 1)).to(tl.float32)
-    b_Ai33 = tl.load(p_Akk33, boundary_check=(0, 1)).to(tl.float32)
-
-    # 前向替换: A = -strict_tril(D); for i=2..BC-1: A[i] += A[i] · A 行累加; A += I
-    m_A = o_i[:, None] > o_i[None, :]
-    m_I = o_i[:, None] == o_i[None, :]
-
-    b_Ai00 = -tl.where(m_A, b_Ai00, 0.0)
-    b_Ai11 = -tl.where(m_A, b_Ai11, 0.0)
-    b_Ai22 = -tl.where(m_A, b_Ai22, 0.0)
-    b_Ai33 = -tl.where(m_A, b_Ai33, 0.0)
-
-    # 逐行前向替换 (i 从 2 到 BC-1); 尾 chunk 用 min(BC, T - i_tc0) 截断
-    for i in range(2, min(BC, T - i_tc0)):
-        b_a00 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
-        b_a00 = tl.where(o_i < i, b_a00, 0.0)
-        b_a00 += tl.sum(b_a00[:, None] * b_Ai00, 0)
-        b_Ai00 = tl.where((o_i == i)[:, None], b_a00, b_Ai00)
-    for i in range(BC + 2, min(2 * BC, T - i_tc0)):
-        b_a11 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
-        b_a11 = tl.where(o_i < i - BC, b_a11, 0.0)
-        b_a11 += tl.sum(b_a11[:, None] * b_Ai11, 0)
-        b_Ai11 = tl.where((o_i == i - BC)[:, None], b_a11, b_Ai11)
-    for i in range(2 * BC + 2, min(3 * BC, T - i_tc0)):
-        b_a22 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
-        b_a22 = tl.where(o_i < i - 2 * BC, b_a22, 0.0)
-        b_a22 += tl.sum(b_a22[:, None] * b_Ai22, 0)
-        b_Ai22 = tl.where((o_i == i - 2 * BC)[:, None], b_a22, b_Ai22)
-    for i in range(3 * BC + 2, min(4 * BC, T - i_tc0)):
-        b_a33 = -tl.load(Akkd + (i_tc0 + i) * H * BC + o_i)
-        b_a33 = tl.where(o_i < i - 3 * BC, b_a33, 0.0)
-        b_a33 += tl.sum(b_a33[:, None] * b_Ai33, 0)
-        b_Ai33 = tl.where((o_i == i - 3 * BC)[:, None], b_a33, b_Ai33)
-
-    b_Ai00 += m_I
-    b_Ai11 += m_I
-    b_Ai22 += m_I
-    b_Ai33 += m_I
-
-    # ── Phase 3: 链式矩阵乘合并逆 ──
-    # 第 1 层: Ai_10, Ai_21, Ai_32
-    b_Ai10 = -tl.dot(
-        tl.dot(b_Ai11, b_Akk10, input_precision="ieee"),
-        b_Ai00,
-        input_precision="ieee",
-    )
-    b_Ai21 = -tl.dot(
-        tl.dot(b_Ai22, b_Akk21, input_precision="ieee"),
-        b_Ai11,
-        input_precision="ieee",
-    )
-    b_Ai32 = -tl.dot(
-        tl.dot(b_Ai33, b_Akk32, input_precision="ieee"),
-        b_Ai22,
-        input_precision="ieee",
-    )
-    # 第 2 层: Ai_20, Ai_31
-    b_Ai20 = -tl.dot(
-        b_Ai22,
-        tl.dot(b_Akk20, b_Ai00, input_precision="ieee")
-        + tl.dot(b_Akk21, b_Ai10, input_precision="ieee"),
-        input_precision="ieee",
-    )
-    b_Ai31 = -tl.dot(
-        b_Ai33,
-        tl.dot(b_Akk31, b_Ai11, input_precision="ieee")
-        + tl.dot(b_Akk32, b_Ai21, input_precision="ieee"),
-        input_precision="ieee",
-    )
-    # 第 3 层: Ai_30
-    b_Ai30 = -tl.dot(
-        b_Ai33,
-        tl.dot(b_Akk30, b_Ai00, input_precision="ieee")
-        + tl.dot(b_Akk31, b_Ai10, input_precision="ieee")
-        + tl.dot(b_Akk32, b_Ai20, input_precision="ieee"),
-        input_precision="ieee",
-    )
-
-    # ── 写回 Akk_out: 10 个子块 ──
-    p_Akk00 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc0, 0), (BC, BC), (1, 0))
-    p_Akk10 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc1, 0), (BC, BC), (1, 0))
-    p_Akk11 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc1, BC), (BC, BC), (1, 0))
-    p_Akk20 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc2, 0), (BC, BC), (1, 0))
-    p_Akk21 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc2, BC), (BC, BC), (1, 0))
-    p_Akk22 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc2, 2 * BC), (BC, BC), (1, 0))
-    p_Akk30 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc3, 0), (BC, BC), (1, 0))
-    p_Akk31 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc3, BC), (BC, BC), (1, 0))
-    p_Akk32 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc3, 2 * BC), (BC, BC), (1, 0))
-    p_Akk33 = tl.make_block_ptr(Akk_out, (T, BT), (H * BT, 1), (i_tc3, 3 * BC), (BC, BC), (1, 0))
-
-    tl.store(p_Akk00, b_Ai00.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk10, b_Ai10.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk11, b_Ai11.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk20, b_Ai20.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk21, b_Ai21.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk22, b_Ai22.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk30, b_Ai30.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk31, b_Ai31.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk32, b_Ai32.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
-    tl.store(p_Akk33, b_Ai33.to(Akk_out.dtype.element_ty), boundary_check=(0, 1))
+    s_k = H * K
+    s_A = H * BT
+    s_beta = H
+    b_off = i_b * T
+    b_offA = i_b * TP  # 缓冲已按 TP=NT*BT 补齐, store 需用 TP 步长
+    r = tl.arange(0, BT)
+    c = tl.arange(0, BT)
+    m_t = (i_tc0 + r) < T
+    m_blk = (r // BC)[:, None] > (r // BC)[None, :]
+    b_I = tl.where(r[:, None] == c[None, :], 1.0, 0.0)
+    o_k = tl.arange(0, K)
+    for hh in range(HM):
+        i_h = hg0 * HM + hh
+        qs = q + b_off * s_k + i_tc0 * s_k + i_h * K
+        ks = k + b_off * s_k + i_tc0 * s_k + i_h * K
+        gs = g + b_off * s_k + i_tc0 * s_k + i_h * K
+        b_beta = tl.load(beta + b_off * s_beta + (i_tc0 + r) * s_beta + i_h,
+                         mask=m_t, other=0.0).to(tl.float32)
+        b_q = tl.load(qs + r[:, None] * s_k + o_k[None, :],
+                      mask=m_t[:, None], other=0.0).to(tl.float32)
+        b_k = tl.load(ks + r[:, None] * s_k + o_k[None, :],
+                      mask=m_t[:, None], other=0.0).to(tl.float32)
+        b_g = tl.load(gs + r[:, None] * s_k + o_k[None, :],
+                      mask=m_t[:, None], other=0.0).to(tl.float32)
+        b_eg = tl.math.exp2(b_g)
+        b_Ke = b_k * tl.math.exp2(-b_g)
+        b_Mkk = tl.dot(b_k * b_eg * b_beta[:, None], tl.trans(b_Ke))
+        b_Mqk = tl.dot(b_q * b_eg * scale, tl.trans(b_Ke))
+        As = Aqk + b_offA * s_A + i_tc0 * s_A + i_h * BT
+        tl.store(As + r[:, None] * s_A + c[None, :],
+                 tl.where(m_blk, b_Mqk, 0.0).to(Aqk.dtype.element_ty))
+        b_L = tl.where(r[:, None] > c[None, :], b_Mkk, 0.0)
+        b_inv = b_I - b_L
+        b_pow = b_L
+        b_pow = tl.dot(b_pow, b_pow)
+        b_inv = tl.dot(b_inv, b_I + b_pow)
+        if NP >= 2:
+            b_pow = tl.dot(b_pow, b_pow)
+            b_inv = tl.dot(b_inv, b_I + b_pow)
+        if NP >= 3:
+            b_pow = tl.dot(b_pow, b_pow)
+            b_inv = tl.dot(b_inv, b_I + b_pow)
+        if NP >= 4:
+            b_pow = tl.dot(b_pow, b_pow)
+            b_inv = tl.dot(b_inv, b_I + b_pow)
+        if NP >= 5:
+            b_pow = tl.dot(b_pow, b_pow)
+            b_inv = tl.dot(b_inv, b_I + b_pow)
+        Os = Akk_out + b_offA * s_A + i_tc0 * s_A + i_h * BT
+        tl.store(Os + r[:, None] * s_A + c[None, :],
+                 b_inv.to(Akk_out.dtype.element_ty))
 
 
 def inter_solve_triton(
@@ -543,19 +357,27 @@ def inter_solve_triton(
     Aqk=None, Akk_out=None,
     chunk_size=_BT, sub_chunk_size=_BC,
 ):
-    """triton kernel 版; 返回 (Aqk, Akk_inv)。所有张量已在 NPU。"""
+    """融合单 kernel 版（head-merged, npow=3 截断逆）。返回 (Aqk, Akk_inv)。
+
+    忽略 Akkd：对角 16×16 块由内部 Mkk 直接给出（与 K2 的 Akkd 数学一致）。
+    K 需为 2 幂（单 tile tl.arange）；H%16==0 时 HM=16，否则 HM=1。
+    """
     B, T, H, K = q.shape
     BT, BC = chunk_size, sub_chunk_size
     NT = _cdiv(T, BT)
-    BK = triton.next_power_of_2(K)
+    TP = NT * BT
+    dev = q.device
+    # 缓冲按 NT*BT 补齐 + torch.empty: kernel 做无掩码全量写回（掩码处写 0.0），
+    # 消除 tail 行掩码 store 的标量开销与每次调用的 2×402MB memset（ZerosLike）。
     if Aqk is None:
-        Aqk = torch.zeros(B, T, H, BT, device=q.device, dtype=q.dtype)
+        Aqk = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)
     if Akk_out is None:
-        Akk_out = torch.zeros(B, T, H, BT, device=q.device, dtype=q.dtype)
-    grid = (NT, B * H)
+        Akk_out = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)
+    HM = 16 if H % 16 == 0 else 1
+    grid = (NT, B * (H // HM))
     _inter_solve_kernel[grid](
-        q, k, g, beta, Akkd, Aqk, Akk_out, float(scale),
-        T, H=H, K=K, BT=BT, BC=BC, BK=BK, num_warps=1,
+        q, k, g, beta, Aqk, Akk_out, float(scale), T, TP,
+        H=H, K=K, BT=BT, BC=BC, HM=HM, NP=3, num_warps=4,
     )
     torch.npu.synchronize()
-    return Aqk, Akk_out
+    return Aqk[:, :T], Akk_out[:, :T]

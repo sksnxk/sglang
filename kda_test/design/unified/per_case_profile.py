@@ -12,7 +12,7 @@
     triton 时间; 其余（aclnn* 等）= torch_npu 拼接时间;
   * ``profile_meta.json`` 兜底交叉校验段数与 kernel 名映射。
 
-输出 ``results.csv``（与 UNIFIED_BENCH_PLAN.md §4.4 schema 一致）::
+输出 ``results.csv``（与 README.md §7 schema 一致）::
 
     case_id, B, T, H, K, V, kernel, torch_us, triton_us, speedup, max_diff, status
 
@@ -111,9 +111,15 @@ def _segment_by_markers(rows, profile_meta):
     """按 _kda_bench_marker 行切分 op_summary 行序为 (case, kernel) 段。
 
     返回 list[dict]: 每段 {case_id, kernel_id, torch_us, triton_us, triton_calls}。
-    段顺序对应 profile_meta（bench.py 写入顺序）: marker 成对出现，
-    相邻两个 marker 之间的行 = 一个 (case, kernel) 段。
-    首个 marker 之前的行归入虚拟 setup 段（不计入）。
+    段顺序对应 profile_meta（bench.py 写入顺序）。
+
+    3-marker 协议 (bench.py 模式 B):
+      marker 0: (case, kernel) torch 段开始
+      marker 1: torch 段结束 / triton 段开始
+      marker 2: (case, kernel) triton 段结束
+    相邻 marker 之间的行 = 一个子段:
+      rows[marker[3i]   + 1 : marker[3i+1]] = torch 段
+      rows[marker[3i+1] + 1 : marker[3i+2]] = triton 段
 
     profile_meta 中 skipped=True 的段没有 marker（bench.py 跳过时不发 marker），
     所以实际段数 = 非 skipped 段数。这里用 profile_meta 的非 skipped 子集
@@ -121,16 +127,14 @@ def _segment_by_markers(rows, profile_meta):
     """
     # 收集所有 marker 行的索引
     marker_idx = [i for i, (n, _) in enumerate(rows) if n == MARKER_NAME]
-    if len(marker_idx) < 2:
+    if len(marker_idx) < 3:
         raise SystemExit(
             f"[!] 只找到 {len(marker_idx)} 个 marker 行，无法分段。"
             "请确认 bench.py --msprof 模式已正确运行。"
         )
 
-    # marker 成对: [0,1)=seg0, [2,3)=seg1, ...; 相邻 marker 之间也可能有内容
-    # 但 bench.py 逻辑是: marker(开始) -> kernel 调用 -> marker(结束)
-    # 所以 segment[i] = rows[marker_idx[2i]+1 : marker_idx[2i+1]]
-    n_seg = len(marker_idx) // 2
+    # 3-marker 协议: 每 (case, kernel) 有 3 个 marker
+    n_seg = len(marker_idx) // 3
 
     # profile_meta 中非 skipped 的段（这些才有实际 marker）
     if profile_meta:
@@ -140,36 +144,43 @@ def _segment_by_markers(rows, profile_meta):
 
     segments = []
     for i in range(n_seg):
-        start = marker_idx[2 * i] + 1
-        end = marker_idx[2 * i + 1]
-        seg_rows = rows[start:end]
-        # 段内分类: triton op 行 vs torch_npu 拼接行
+        # torch 子段: marker[3i] + 1 .. marker[3i+1]
+        torch_start = marker_idx[3 * i] + 1
+        torch_end = marker_idx[3 * i + 1]
+        torch_rows = rows[torch_start:torch_end]
+
+        # triton 子段: marker[3i+1] + 1 .. marker[3i+2]
+        triton_start = marker_idx[3 * i + 1] + 1
+        triton_end = marker_idx[3 * i + 2]
+        triton_rows = rows[triton_start:triton_end]
+
+        # torch 子段: 所有行都是 torch_npu 拼接时间
         torch_us = 0.0
+        torch_durs = []
+        for name, dur in torch_rows:
+            if name == MARKER_NAME:
+                continue
+            torch_us += dur
+            torch_durs.append(dur)
+
+        # triton 子段: 所有行计入 triton 时间（含 torch_npu 委托如 K2）
         triton_us = 0.0
         triton_calls = 0
-        triton_durs = []  # 每次 triton 调用的耗时（顺序排列）
-        torch_durs = []   # 每次 torch 调用的耗时（aclnn 拼接段，按顺序）
+        triton_durs = []
         triton_op_seen = None
-        for name, dur in seg_rows:
-            # 匹配某个 kernel 的 triton op 名（前缀匹配，因 op_summary 可能
-            # 带后缀或完整路径）
-            matched = None
+        for name, dur in triton_rows:
+            if name == MARKER_NAME:
+                continue
+            triton_us += dur
+            # 检查是否是 triton kernel op（用于计数）
             for top, kid in TRITON_OPS.items():
                 if name == top or name.startswith(top):
-                    matched = kid
+                    triton_calls += 1
+                    triton_durs.append(dur)
                     triton_op_seen = top
                     break
-            if matched is not None:
-                triton_us += dur
-                triton_calls += 1
-                triton_durs.append(dur)
-            else:
-                # 排除其他 marker 或非算子行
-                if name == MARKER_NAME:
-                    continue
-                torch_us += dur
-                torch_durs.append(dur)
-        # 从 non_skipped profile_meta 取 case_id / kernel_id / repeats（兜底: 用段序号）
+
+        # 从 non_skipped profile_meta 取 case_id / kernel_id / repeats
         if i < len(non_skipped):
             pm = non_skipped[i]
             case_id = pm.get("case_id", f"seg{i}")
@@ -188,7 +199,7 @@ def _segment_by_markers(rows, profile_meta):
             "triton_durs": triton_durs,
             "torch_durs": torch_durs,
             "repeats": repeats,
-            "skipped": False,  # 实际有 marker 的段都是非 skipped 的
+            "skipped": False,
             "triton_op_seen": triton_op_seen,
         })
     return segments
@@ -288,7 +299,12 @@ def main(argv=None):
                 torch_us = s["torch_us"] / total_iters     # 每次 torch 调用的平均
             else:
                 torch_us = s["torch_us"] / max(s["triton_calls"], 1)
-            triton_us = sum(tri_durs) / len(tri_durs) if tri_durs else 0
+            if tri_durs:
+                triton_us = sum(tri_durs) / len(tri_durs)
+            else:
+                # K2 等委托给 torch_npu 的算子: triton 子段内无 triton kernel op，
+                # 所有 aclnn 原子 op 已计入 triton_us，按 repeats 取均值
+                triton_us = s["triton_us"] / max(s["repeats"], 1)
         else:
             torch_us = s["torch_us"]
             triton_us = s["triton_us"]

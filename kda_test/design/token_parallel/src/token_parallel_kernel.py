@@ -13,7 +13,17 @@
   * ``token_parallel_ref``    —— 纯 torch CPU 参考（逐 token 循环，ground truth）
   * ``token_parallel_torch``  —— torch 元算子版本（**性能/精度基准**，按 sub-chunk
                                 批量化 matmul，避免 Python 双层循环）
-  * ``token_parallel_triton`` —— triton kernel 版（1 CTA / token / head）
+  * ``token_parallel_triton`` —— triton kernel 版（Route A: 向量化 sub-chunk 计算,
+                                消除内层 Python for j 循环; 使用 tl.dot 批量矩阵乘）
+
+优化说明（见 OPTIMIZATION_LOG.md / kernel_metadata.json）:
+  * 原 kernel 为 1 CTA/token/head, grid=(B*T, H), 大 case (B*T*H) 展平后
+    远超 NPU coreDim 上限 65535 → kernel 无法启动。
+  * Route A (本文件) + Route B (token_parallel_kernel_opt_B.py) 均改为
+    chunked grid = (B*cdiv(T,BT), H), 消除 grid 超限。
+  * 本文件采用 Route A 策略: 数学变换 exp2(g[i]-g[j]) → exp2(g[i])*exp2(-g[j]),
+    用 tl.dot 批量计算 BC×BC gated-dot, 消除 Python for j 循环,
+    aiv_scalar_ratio 0.38→0.059 (首次 < 0.10 阈值)。
 """
 
 import torch
@@ -128,52 +138,271 @@ def token_parallel_torch(q, k, gk, beta, scale, chunk_size=_BT, sub_chunk_size=_
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# triton kernel：1 CTA / token / head（与上游 token-parallel 策略一致）
+# triton kernel（Route C：整 chunk 大 dot + 连续写回）
 # ═══════════════════════════════════════════════════════════════════════════
 
 @triton.jit(do_not_specialize=["T"])
 def _token_parallel_kernel(
-    q, k, g, beta, Aqk, Akk,
+    q, k, g, beta, Aqk, AkkScratch,
     scale,
     T, H: tl.constexpr, K: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr,
 ):
-    """1 个 CTA 处理 1 个 (token, head)，遍历同 sub-chunk 内先前 token。"""
-    i_tg, i_hg = tl.program_id(0), tl.program_id(1)
-    bos = (i_tg // T) * T
-    i_t = i_tg % T
-    if i_t >= T:
-        return
-    i_c = i_t // BT
-    i_s = (i_t % BT) // BC
-    i_ts = i_c * BT + i_s * BC
+    """1 CTA / (chunk, head)。整 chunk [BT,BK] 一次 tl.dot, 对角线 block 掩码。
+
+    Route C 优化策略（对比 Route A/B）:
+      * Route A 每 sub-chunk (16 tokens) 做 2 个 [16,128]@[128,16] 小 dot,
+        共 4 次迭代 —— dot 太小 (cube 利用率低)、每迭代标量开销高, 实测
+        1243ms (6x 慢于 torch)。
+      * Route C 一次加载整 chunk (BT=64 行), 只做 2 个大 tl.dot
+        [64,128]@[128,64] (Aqk / Akk), 一次性对角线掩码 + 2D 写回。
+      * **Ascend MTE 坑**: 写回若列地址非单调 (Akk 的 col 映射 c-(r//16)*16),
+        MTE 指令地址越界 → aicore exception。故 Aqk 直接写 [B,T,H,BT] 输出,
+        Akk_full 写同布局 AkkScratch [B,T,H,BT] (连续), driver 用 torch.gather
+        把对角线 16×16 block 收拢到 [B,T,H,16]。
+      * **无掩码写回** (msprof 显示 aiv_scalar 0.416 是头号瓶颈, 来自带 mask 的
+        store 逐 lane 标量寻址): Aqk/Akk 输出缓冲按 NT*BT 补齐, store 不加 mask
+        (掩码处写 0.0 即可, 与 torch ref 的零初值一致), kernel 9.82ms vs 10.87ms。
+
+    数学 (exp2(g[i]-g[j]) = exp2(g[i])*exp2(-g[j])):
+      Aqk[i,j] = (q*exp2(g)) @ (k*exp2(-g))^T * scale    (j<=i, 同 block)
+      Akk[i,j] = (k·beta*exp2(g)) @ (k*exp2(-g))^T        (j<i,  同 block)
+    """
+    i_cg, i_hg = tl.program_id(0), tl.program_id(1)
+    NT = tl.cdiv(T, BT)
+    bos = (i_cg // NT) * T
+    i_c = i_cg % NT
+    chunk_start = i_c * BT
 
     o_k = tl.arange(0, BK)
-    m_k = o_k < K
+    m_k = o_k.to(tl.float32) < K
+    o_r = tl.arange(0, BT)
+    T_fp = T.to(tl.float32)
+    chunk_start_fp = chunk_start.to(tl.float32)
+    m_rows = (chunk_start_fp + o_r.to(tl.float32)) < T_fp
 
-    base_i = bos * H * K + i_t * H * K + i_hg * K
-    qb = tl.load(q + base_i + o_k, mask=m_k, other=0.0).to(tl.float32)
-    kb = tl.load(k + base_i + o_k, mask=m_k, other=0.0).to(tl.float32)
-    gb = tl.load(g + base_i + o_k, mask=m_k, other=0.0).to(tl.float32)
-    beta_v = tl.load(beta + bos * H + i_t * H + i_hg).to(tl.float32)
-    kb = kb * beta_v  # k·beta[i]
+    base_q = q + bos * H * K + i_hg * K
+    base_k = k + bos * H * K + i_hg * K
+    base_g = g + bos * H * K + i_hg * K
+    base_beta = beta + bos * H + i_hg
+    base_aqk = Aqk + bos * H * BT + i_hg * BT
+    base_akk = AkkScratch + bos * H * BT + i_hg * BT
 
-    for j in range(i_ts, min(i_t + 1, min(T, i_ts + BC))):
-        base_j = bos * H * K + j * H * K + i_hg * K
-        kj = tl.load(k + base_j + o_k, mask=m_k, other=0.0).to(tl.float32)
-        gj = tl.load(g + base_j + o_k, mask=m_k, other=0.0).to(tl.float32)
-        kgj = kj * tl.math.exp2(gb - gj)
-        kgj = tl.where(m_k, kgj, 0.0)
-        aqk = tl.sum(qb * kgj, axis=0) * scale
-        akk = tl.sum(kb * kgj, axis=0) * tl.where(j < i_t, 1.0, 0.0)
-        tl.store(
-            Aqk + bos * H * BT + i_t * H * BT + i_hg * BT + (j % BT),
-            aqk,
-        )
-        tl.store(
-            Akk + bos * H * BC + i_t * H * BC + i_hg * BC + (j - i_ts),
-            akk,
-        )
+    # ── 一次加载整 chunk ──
+    row_offset = (chunk_start + o_r[:, None]) * H * K
+    qc = tl.load(base_q + row_offset + o_k[None, :],
+                 mask=m_rows[:, None] & m_k[None, :], other=0.0,
+                 care_padding=False).to(tl.float32)
+    kc = tl.load(base_k + row_offset + o_k[None, :],
+                 mask=m_rows[:, None] & m_k[None, :], other=0.0,
+                 care_padding=False).to(tl.float32)
+    gc = tl.load(base_g + row_offset + o_k[None, :],
+                 mask=m_rows[:, None] & m_k[None, :], other=0.0,
+                 care_padding=False).to(tl.float32)
+    betac = tl.load(base_beta + (chunk_start + o_r) * H,
+                    mask=m_rows, other=0.0, care_padding=False).to(tl.float32)
+
+    # ── 数学变换 + 大 dot ──
+    qe = qc * tl.math.exp2(gc)           # [BT, BK]
+    ke = kc * tl.math.exp2(-gc)          # [BT, BK]
+    Aqk_full = tl.dot(qe, tl.trans(ke))  # [BT, BT]
+    kbe = (kc * betac[:, None]) * tl.math.exp2(gc)
+    Akk_full = tl.dot(kbe, tl.trans(ke))  # [BT, BT]
+
+    # ── 对角线 16×16 block 掩码 (值置 0, 非 store mask) ──
+    br = o_r // BC
+    bc_ = tl.arange(0, BT) // BC
+    ri = o_r % BC
+    ci = tl.arange(0, BT) % BC
+    diag = br[:, None] == bc_[None, :]
+    causal = ri[:, None] >= ci[None, :]       # j<=i
+    strict = ri[:, None] > ci[None, :]        # j<i
+
+    Aqk_full = tl.where(diag & causal, Aqk_full * scale, 0.0)
+    Akk_full = tl.where(diag & strict, Akk_full, 0.0)
+
+    # ── 2D 无掩码连续写回 (缓冲按 NT*BT 补齐, 列单调 0..BT-1) ──
+    r_o = chunk_start + o_r
+    tl.store(base_aqk + r_o[:, None] * H * BT + tl.arange(0, BT)[None, :], Aqk_full)
+    tl.store(base_akk + r_o[:, None] * H * BT + tl.arange(0, BT)[None, :], Akk_full)
+
+
+@triton.jit(do_not_specialize=["T"])
+def _token_parallel_kernel_hm2(
+    q, k, g, beta, Aqk, AkkScratch,
+    scale,
+    T, H: tl.constexpr, K: tl.constexpr,
+    BT: tl.constexpr, BC: tl.constexpr, HM: tl.constexpr,
+):
+    """head-merged 版（grid=(cdiv(T,BT), B*H//HM), 每 CTA 循环 HM 个 head）。
+
+    相对 ``_token_parallel_kernel``（1 CTA/(chunk,head), 24576 CTA）:
+      * CTA 数 24576→1536, 摊薄每 CTA 的标量寻址/掩码开销;
+      * 与 K3 对齐的标量优化: 去掉 K 维 mask（K 需为 2 幂）、scale 折叠进
+        pre-dot q 乘、exp2(gc)/exp2(-gc) 各算一次、keep/strict 掩码循环外预计算。
+
+    数学同 ``_token_parallel_kernel``:
+      Aqk[i,j] = <q[i], k[j]*exp2(g[i]-g[j])>*scale (j<=i, 同 sub-chunk)
+      Akk[i,j] = <k[i]·beta[i], k[j]*exp2(g[i]-g[j])> (j<i, 同 sub-chunk)
+    """
+    i_cg, i_hg = tl.program_id(0), tl.program_id(1)
+    NT = tl.cdiv(T, BT)
+    n_hg = H // HM
+    i_b = i_hg // n_hg
+    hg0 = i_hg % n_hg
+    bos = i_b * T
+    i_c = i_cg % NT
+    chunk_start = i_c * BT
+
+    o_k = tl.arange(0, K)
+    o_r = tl.arange(0, BT)
+    T_fp = T.to(tl.float32)
+    chunk_start_fp = chunk_start.to(tl.float32)
+    m_rows = (chunk_start_fp + o_r.to(tl.float32)) < T_fp
+
+    # 掩码（循环外一次计算, 复用）: 对角 16×16 块内 causal / strict
+    br = o_r // BC
+    bc_ = tl.arange(0, BT) // BC
+    ri = o_r % BC
+    ci = tl.arange(0, BT) % BC
+    diag = br[:, None] == bc_[None, :]
+    keep = diag & (ri[:, None] >= ci[None, :])
+    strict = diag & (ri[:, None] > ci[None, :])
+
+    row_offset = (chunk_start + o_r[:, None]) * H * K
+    col_bt = tl.arange(0, BT)[None, :]
+    row_akk = (chunk_start + o_r[:, None]) * H * BT
+
+    for hh in range(HM):
+        i_h = hg0 * HM + hh
+        base_q = q + bos * H * K + i_h * K
+        base_k = k + bos * H * K + i_h * K
+        base_g = g + bos * H * K + i_h * K
+        base_beta = beta + bos * H + i_h
+        base_aqk = Aqk + bos * H * BT + i_h * BT
+        base_akk = AkkScratch + bos * H * BT + i_h * BT
+
+        qc = tl.load(base_q + row_offset + o_k[None, :],
+                     mask=m_rows[:, None], other=0.0,
+                     care_padding=False).to(tl.float32)
+        kc = tl.load(base_k + row_offset + o_k[None, :],
+                     mask=m_rows[:, None], other=0.0,
+                     care_padding=False).to(tl.float32)
+        gc = tl.load(base_g + row_offset + o_k[None, :],
+                     mask=m_rows[:, None], other=0.0,
+                     care_padding=False).to(tl.float32)
+        betac = tl.load(base_beta + (chunk_start + o_r) * H,
+                        mask=m_rows, other=0.0, care_padding=False).to(tl.float32)
+
+        eg = tl.math.exp2(gc)
+        eneg = tl.math.exp2(-gc)
+        qe = qc * eg * scale
+        ke = kc * eneg
+        Aqk_full = tl.dot(qe, tl.trans(ke))
+        kbe = (kc * betac[:, None]) * eg
+        Akk_full = tl.dot(kbe, tl.trans(ke))
+
+        Aqk_full = tl.where(keep, Aqk_full, 0.0)
+        Akk_full = tl.where(strict, Akk_full, 0.0)
+
+        tl.store(base_aqk + row_akk + col_bt, Aqk_full)
+        tl.store(base_akk + row_akk + col_bt, Akk_full)
+
+
+@triton.jit(do_not_specialize=["T"])
+def _token_parallel_kernel_hm3(
+    q, k, g, beta, Aqk, AkkOut,
+    scale,
+    T, H: tl.constexpr, K: tl.constexpr,
+    BT: tl.constexpr, BC: tl.constexpr, HM: tl.constexpr,
+):
+    """head-merged v3: 同 hm2, 但 Akk 对角线块用 tl.gather 在 kernel 内收拢为
+    [BT,BC] 紧凑写回 [B,T,H,BC]，消除 scratch 满宽写 + driver torch.gather
+    （msprof: gather 链 ~2ms/调用）。K 需为 2 幂。"""
+    i_cg, i_hg = tl.program_id(0), tl.program_id(1)
+    NT = tl.cdiv(T, BT)
+    n_hg = H // HM
+    i_b = i_hg // n_hg
+    hg0 = i_hg % n_hg
+    bos = i_b * T
+    i_c = i_cg % NT
+    chunk_start = i_c * BT
+
+    o_k = tl.arange(0, K)
+    o_r = tl.arange(0, BT)
+    T_fp = T.to(tl.float32)
+    chunk_start_fp = chunk_start.to(tl.float32)
+    m_rows = (chunk_start_fp + o_r.to(tl.float32)) < T_fp
+
+    br = o_r // BC
+    bc_ = tl.arange(0, BT) // BC
+    ri = o_r % BC
+    ci = tl.arange(0, BT) % BC
+    diag = br[:, None] == bc_[None, :]
+    keep = diag & (ri[:, None] >= ci[None, :])      # Aqk: j<=i 同 sub-chunk
+    o_cc = tl.arange(0, BC)
+    col_idx = (o_r // BC)[:, None] * BC + o_cc[None, :]   # [BT,BC] 行依赖列偏移
+    strict = (o_r % BC)[:, None] > o_cc[None, :]          # Akk: 块内 j<i
+
+    row_offset = (chunk_start + o_r[:, None]) * H * K
+    col_bt = tl.arange(0, BT)[None, :]
+    row_aqk = (chunk_start + o_r[:, None]) * H * BT
+    row_akk = (chunk_start + o_r[:, None]) * H * BC
+
+    for hh in range(HM):
+        i_h = hg0 * HM + hh
+        base_q = q + bos * H * K + i_h * K
+        base_k = k + bos * H * K + i_h * K
+        base_g = g + bos * H * K + i_h * K
+        base_beta = beta + bos * H + i_h
+        base_aqk = Aqk + bos * H * BT + i_h * BT
+        base_akk = AkkOut + bos * H * BC + i_h * BC
+
+        qc = tl.load(base_q + row_offset + o_k[None, :],
+                     mask=m_rows[:, None], other=0.0,
+                     care_padding=False).to(tl.float32)
+        kc = tl.load(base_k + row_offset + o_k[None, :],
+                     mask=m_rows[:, None], other=0.0,
+                     care_padding=False).to(tl.float32)
+        gc = tl.load(base_g + row_offset + o_k[None, :],
+                     mask=m_rows[:, None], other=0.0,
+                     care_padding=False).to(tl.float32)
+        betac = tl.load(base_beta + (chunk_start + o_r) * H,
+                        mask=m_rows, other=0.0, care_padding=False).to(tl.float32)
+
+        eg = tl.math.exp2(gc)
+        eneg = tl.math.exp2(-gc)
+        qe = qc * eg * scale
+        ke = kc * eneg
+        Aqk_full = tl.dot(qe, tl.trans(ke))
+        kbe = (kc * betac[:, None]) * eg
+        Akk_full = tl.dot(kbe, tl.trans(ke))
+
+        Aqk_full = tl.where(keep, Aqk_full, 0.0)
+        tl.store(base_aqk + row_aqk + col_bt, Aqk_full)
+
+        Akk_diag = tl.gather(Akk_full, col_idx, axis=1)   # [BT,BC]
+        Akk_diag = tl.where(strict, Akk_diag, 0.0)
+        tl.store(base_akk + row_akk + o_cc[None, :], Akk_diag)
+
+
+def _gather_akk_diag(scratch, BC, T=None):
+    """把 [B,TP,H,BT] scratch 中对角线 16×16 block 收拢为 [B,T,H,BC]。
+
+    scratch 可能按 NT*BT 补齐 (unmasked-store 需要), 返回前按真实 T 裁剪。
+    """
+    B, TP, H, BT = scratch.shape
+    NT = TP // BT
+    if T is None:
+        T = TP
+    dev = scratch.device
+    r = torch.arange(BT, device=dev)
+    idx = (r.view(1, 1, BT, 1, 1) // BC * BC +
+           torch.arange(BC, device=dev).view(1, 1, 1, 1, BC))
+    idx = idx.expand(B, NT, BT, H, BC)          # [B,NT,BT,H,BC]
+    scr = scratch.reshape(B, NT, BT, H, BT)     # view
+    Akk = torch.gather(scr, 4, idx)             # [B,NT,BT,H,BC]
+    return Akk.reshape(B, NT * BT, H, BC)[:, :T].contiguous()
 
 
 def token_parallel_triton(
@@ -181,18 +410,50 @@ def token_parallel_triton(
     Aqk=None, Akk=None,
     chunk_size=_BT, sub_chunk_size=_BC,
 ):
-    """triton kernel 版; 返回 (Aqk, Akk)。所有张量已在 NPU。"""
+    """triton kernel 版 (Route C: 整 chunk 大 dot + 无掩码写回)。返回 (Aqk, Akk)。
+
+    相比旧委托 torch_npu 的实现，这里是**真正的 triton kernel**：
+      * grid = (B*cdiv(T,BT), H), 每 CTA 一个 (chunk,head), 整 chunk 2 个大
+        tl.dot, 对角线 block 掩码, 无掩码连续写回 (缓冲按 NT*BT 补齐)。
+      * Akk 对角线 block 由 driver 用 torch.gather 收拢 (MTE 列映射会越界)。
+    """
     B, T, H, K = q.shape
     BT, BC = chunk_size, sub_chunk_size
     BK = triton.next_power_of_2(K)
+    NT = _cdiv(T, BT)
+    TP = NT * BT
+    dev = q.device
+    # kernel 做无掩码全量写回（缓冲按 NT*BT 补齐, 掩码处写 0.0）, 故无需预清零。
+    # 用 empty 避免每次调用多一次 800MB memset kernel（在计时区段内）。
     if Aqk is None:
-        Aqk = torch.zeros(B, T, H, BT, device=q.device, dtype=torch.float32)
-    if Akk is None:
-        Akk = torch.zeros(B, T, H, BC, device=q.device, dtype=torch.float32)
-    grid = (B * T, H)
+        Aqk = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)
+    # head-merge 快速路径 (hm3): K 为 2 幂时用 tl.arange(0,K) 无 K 掩码, 且
+    # Akk 对角线块在 kernel 内 tl.gather 收拢为 [B,T,H,BC] 紧凑输出, 消除
+    # scratch 满宽写 + driver torch.gather (~2ms/调用)。HM=16 使 grid 第 2 维
+    # 从 B*H 缩到 B*H//16 (24576→1536 CTA)。H%16!=0 时 HM=1 退化为与原 kernel
+    # 相同的 1 CTA/(chunk,head) 结构。
+    if K == BK:
+        HM = 16 if H % 16 == 0 else 1
+        grid = (NT, B * (H // HM))
+        if Akk is None:
+            Akk = torch.empty(B, TP, H, BC, device=dev, dtype=torch.float32)
+        _token_parallel_kernel_hm3[grid](
+            q, k, gk, beta, Aqk, Akk, float(scale),
+            T, H=H, K=K, BT=BT, BC=BC, HM=HM, num_warps=1,
+        )
+        torch.npu.synchronize()
+        return Aqk[:, :T], Akk[:, :T]
+    # 回退路径: K 非 2 幂 → 原 _token_parallel_kernel + torch.gather 收拢
+    scratch = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)
+    grid = (B * NT, H)
     _token_parallel_kernel[grid](
-        q, k, gk, beta, Aqk, Akk, float(scale),
+        q, k, gk, beta, Aqk, scratch, float(scale),
         T, H=H, K=K, BT=BT, BC=BC, BK=BK, num_warps=1,
     )
     torch.npu.synchronize()
+    Aqk = Aqk[:, :T]
+    if Akk is None:
+        Akk = _gather_akk_diag(scratch, BC, T=T)
+    else:
+        Akk.copy_(_gather_akk_diag(scratch, BC, T=T))
     return Aqk, Akk
